@@ -1,0 +1,22 @@
+# ─────────────────────────────────────────────────────────────────
+# SONYA — полный набор для hook / story / educational / trailer
+# Включает Whisper ASR + аудио-анализ.
+# Установка: pip install -r requirements_full.txt
+# Время: ~10–20 мин на Vast.ai (Whisper большой)
+# ─────────────────────────────────────────────────────────────────
+
+# Включаем всё из минимального
+-r requirements_min.txt
+
+# --- ASR (нужен hook / story / educational) ---
+openai-whisper>=20231117
+
+# --- Аудио-анализ ---
+librosa>=0.10.1
+soundfile>=0.12.1
+
+# --- ML утилиты (story_mode, educational_mode) ---
+scikit-learn>=1.3.0
+
+# --- Скачивание видео (опционально) ---
+yt-dlp>=2023.12.0

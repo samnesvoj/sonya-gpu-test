@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.local
+outputs/
+data/input/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.zip
+*.pt
+*.db
