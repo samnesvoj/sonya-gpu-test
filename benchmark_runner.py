@@ -402,6 +402,63 @@ def _export_decision_from_score(top1: Dict, mode: str) -> str:
     return "reject"
 
 
+def _classify_export_decision(
+    mode: str,
+    raw: Dict,
+    top1: Dict,
+    candidates: List[Dict],
+    asr_segments_count: int = 0,
+) -> Tuple[str, List[str]]:
+    """Учитывает сигналы из самих режимов (weak_fallback, degraded_preview,
+    topic_source). Возвращает (decision, reasons)."""
+    score_based = _export_decision_from_score(top1, mode)
+    reasons: List[str] = [f"score_based={score_based}"]
+
+    if len(candidates) == 0:
+        reasons.append("no_final_candidates")
+        return "reject", reasons
+
+    if mode == "hook":
+        if raw.get("weak_hook_fallback_used"):
+            reasons.append("weak_hook_fallback_used")
+            return "manual_review", reasons
+        return score_based, reasons
+
+    if mode == "story":
+        if raw.get("weak_story_fallback_used"):
+            reasons.append("weak_story_fallback_used")
+            return "manual_review", reasons
+        return score_based, reasons
+
+    if mode == "viral":
+        return score_based, reasons
+
+    if mode == "educational":
+        topic_source = raw.get("topic_source")
+        topics = raw.get("topic_segments") or []
+        if (
+            topic_source == "fallback_single_topic"
+            and asr_segments_count > 10
+            and score_based == "auto_export"
+        ):
+            reasons.append("single_topic_fallback_with_many_asr")
+            return "manual_review", reasons
+        if len(topics) <= 1 and asr_segments_count > 10 and score_based == "auto_export":
+            reasons.append("only_one_topic_despite_many_asr")
+            return "manual_review", reasons
+        return score_based, reasons
+
+    if mode == "trailer_preview":
+        # Режим уже сам классифицирует и передаёт причины
+        mode_decision = raw.get("export_decision")
+        mode_reasons = raw.get("export_decision_reasons") or []
+        if mode_decision in ("auto_export", "manual_review", "reject"):
+            return mode_decision, list(mode_reasons) + reasons
+        return score_based, reasons
+
+    return score_based, reasons
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # АДАПТЕРЫ РЕЖИМОВ
 # Сигнатура каждого: (video_path, video_duration_sec, base_analysis,
@@ -432,7 +489,9 @@ def run_hook(
         )
         moments = raw.get("hook_moments", [])
         candidates, ranking, top1 = _normalize_moments(moments, score_key="score")
-        export_decision = _export_decision_from_score(top1, "hook")
+        export_decision, _export_reasons = _classify_export_decision(
+            "hook", raw, top1, candidates
+        )
 
         # Метрики из stats
         stats = raw.get("stats", {})
@@ -459,6 +518,7 @@ def run_hook(
             "export_decision": export_decision,
             "boundary_diagnostics": boundary_diag,
             "mode_metrics": mode_metrics,
+            "_raw_mode_output": raw,
         }
         return result, time.perf_counter() - t0
 
@@ -493,7 +553,9 @@ def run_story(
         )
         moments = raw.get("story_moments", [])
         candidates, ranking, top1 = _normalize_moments(moments, score_key="score")
-        export_decision = _export_decision_from_score(top1, "story")
+        export_decision, _export_reasons = _classify_export_decision(
+            "story", raw, top1, candidates
+        )
 
         # Story-специфичные артефакты из первого момента
         first_raw = ranking[0]["_raw"] if ranking else {}
@@ -540,6 +602,7 @@ def run_story(
             "beats": beats,
             "arcs": arcs,
             "role_probs": role_probs,
+            "_raw_mode_output": raw,
         }
         return result, time.perf_counter() - t0
 
@@ -580,7 +643,10 @@ def run_viral(
         candidates, ranking, top1 = _normalize_moments(
             moments, start_key="start", end_key="end", score_key="virality_score"
         )
-        export_decision = _export_decision_from_score(top1, "viral")
+        viral_raw_dict = moments if isinstance(moments, dict) else {"viral_moments": moments}
+        export_decision, _export_reasons = _classify_export_decision(
+            "viral", viral_raw_dict, top1, candidates
+        )
 
         top1_raw = ranking[0]["_raw"] if ranking else {}
         mode_metrics = {
@@ -601,6 +667,7 @@ def run_viral(
             "export_decision": export_decision,
             "boundary_diagnostics": {},
             "mode_metrics": mode_metrics,
+            "_raw_mode_output": moments if isinstance(moments, dict) else {"viral_moments": moments},
         }
         return result, time.perf_counter() - t0
 
@@ -635,7 +702,10 @@ def run_educational(
         )
         moments = raw.get("educational_moments", [])
         candidates, ranking, top1 = _normalize_moments(moments, score_key="score")
-        export_decision = _export_decision_from_score(top1, "educational")
+        export_decision, _export_reasons = _classify_export_decision(
+            "educational", raw, top1, candidates,
+            asr_segments_count=len(asr_segments or []),
+        )
 
         top1_raw = ranking[0]["_raw"] if ranking else {}
         mode_metrics = {
@@ -658,6 +728,7 @@ def run_educational(
             "export_decision": export_decision,
             "boundary_diagnostics": boundary_diag,
             "mode_metrics": mode_metrics,
+            "_raw_mode_output": raw,
         }
         return result, time.perf_counter() - t0
 
@@ -706,7 +777,9 @@ def run_trailer_preview(
 
         clips = raw.get("trailer_clips", [])
         candidates, ranking, top1 = _normalize_moments(clips, score_key="score")
-        export_decision = _export_decision_from_score(top1, "trailer_preview")
+        export_decision, _export_reasons = _classify_export_decision(
+            "trailer_preview", raw, top1, candidates
+        )
 
         theme_blocks_raw = raw.get("theme_blocks", [])
         themes = [
@@ -841,6 +914,11 @@ METRIC_LABELS_RU: Dict[str, str] = {
     "top1_score":             "Оценка лучшего кандидата",
     "top3_contains_good":     "Хороший вариант есть в top-3",
     "boundary_ok":            "Качество границ (нет обрезки фразы)",
+    # Debug-сигналы фильтрации
+    "raw_proposals_count":    "Предложений до фильтрации (raw proposals)",
+    "rejected_count":         "Отфильтровано кандидатов",
+    "main_reject_reason":     "Главная причина отсева",
+    "had_raw_signal":         "Режим что-то нашёл до финального фильтра",
     # Hook
     "hook_candidate_recall":  "Hook: нашёл ли реальный hook вообще",
     "visual_first_hit":       "Hook: нашёл визуальный hook без текста",
@@ -930,6 +1008,431 @@ def _rebuild_raw(mode: str, result: Dict) -> Dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Debug artifact extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_debug_artifacts(
+    mode: str,
+    raw: Dict,
+    final_candidates: List[Dict],
+    asr_segments: List[Dict],
+) -> Dict[str, Any]:
+    """
+    Извлекает debug-артефакты из сырого вывода режима.
+    Цель: если final_candidates пусто — понять, что именно пошло не так.
+
+    Возвращает словарь с ключами:
+        raw_proposals       — сырые предложения до финального фильтра (если доступны)
+        rejected_candidates — кандидаты, отфильтрованные до top-k
+        filter_reasons      — причины отсева по каждому кандидату / агрегированные счётчики
+        pipeline_trace      — этапы пайплайна и количество элементов на каждом
+        raw_proposals_count — int или None
+        rejected_count      — int или None
+        main_reject_reason  — str или None
+        had_raw_signal      — True если режим вообще что-то нашёл до финального фильтра
+        # режим-специфичные ключи добавляются ниже
+    """
+    stats: Dict = raw.get("stats", {}) or {}
+    error: Optional[str] = raw.get("error")
+
+    raw_proposals: List[Dict] = []
+    rejected_candidates: List[Dict] = []
+    filter_reasons: Dict = {}
+    raw_proposals_count: Optional[int] = None
+    rejected_count: Optional[int] = None
+    main_reject_reason: Optional[str] = error
+    had_raw_signal: bool = len(final_candidates) > 0
+
+    # ── Общий pipeline trace ─────────────────────────────────────────────────
+    pipeline_trace: Dict[str, Any] = {
+        "mode": mode,
+        "asr_segments_count": len(asr_segments),
+        "final_candidates_count": len(final_candidates),
+        "early_exit_error": error,
+        "stats_snapshot": stats,
+    }
+
+    # ── Hook-специфичная диагностика ─────────────────────────────────────────
+    hook_proposals: List[Dict] = []
+    hook_filter_reasons: Dict = {}
+    visual_first_candidates: List[Dict] = []
+    non_hook_risks: List[Dict] = []
+    rejected_hooks: List[Dict] = []
+    weak_hook_fallback_used: bool = False
+    micro_hook_active: bool = False
+
+    if mode == "hook":
+        n_before_nms = stats.get("n_candidates_before_nms")
+        raw_proposals_count = (
+            raw.get("hook_proposals_count")
+            or stats.get("hook_proposals_count")
+            or n_before_nms
+        )
+        had_raw_signal = bool(raw_proposals_count and raw_proposals_count > 0) or had_raw_signal
+
+        proposal_sources = stats.get("proposal_sources_detail") or stats.get("proposal_sources", {})
+
+        # Приоритет: реальные rejected_hooks из режима (v1.1)
+        rejected_hooks = raw.get("rejected_hooks") or stats.get("rejected_hooks") or []
+        # raw_proposals — либо список из mode, либо агрегат
+        if rejected_hooks:
+            hook_proposals = [
+                {"source": src, "count": cnt}
+                for src, cnt in proposal_sources.items()
+            ]
+            raw_proposals = list(rejected_hooks)
+        else:
+            hook_proposals = [
+                {"source": src, "count": cnt}
+                for src, cnt in proposal_sources.items()
+            ]
+            raw_proposals = hook_proposals
+
+        if raw_proposals_count is not None:
+            rejected_count = max(0, raw_proposals_count - len(final_candidates))
+
+        weak_hook_fallback_used = bool(
+            raw.get("weak_hook_fallback_used") or stats.get("weak_hook_fallback_used")
+        )
+        micro_hook_active = bool(
+            raw.get("micro_hook_active") or stats.get("micro_hook_active")
+        )
+
+        # filter_reasons: из режима v1.1 + backward-compat
+        hook_filter_reasons = raw.get("hook_filter_reasons") or stats.get("hook_filter_reasons") or {}
+        export_decisions = stats.get("export_decisions", {})
+        hook_filter_reasons = {
+            **hook_filter_reasons,
+            "export_decisions_in_pool": export_decisions,
+            "avg_false_positive_risk": stats.get("avg_false_positive_risk"),
+            "loose_hook_mode": stats.get("loose_hook_mode"),
+            "threshold_effective": stats.get("threshold_effective"),
+            "min_hook_score_effective": stats.get("min_hook_score_effective"),
+            "weak_hook_fallback_used": weak_hook_fallback_used,
+            "micro_hook_active": micro_hook_active,
+        }
+        filter_reasons = hook_filter_reasons
+
+        # visual_first_candidates: финальные кандидаты с visual proposal_source
+        visual_sources = {"face_reaction", "audio_burst", "visual_onset",
+                          "face_onset", "visual_burst", "motion_onset", "prosody_burst"}
+        visual_first_candidates = [
+            c for c in final_candidates
+            if c.get("_raw", {}).get("proposal_source", "") in visual_sources
+        ]
+        # non_hook_risks: кандидаты с high false_positive_risk
+        non_hook_risks = [
+            {
+                "id": c.get("id"),
+                "start_sec": c.get("start_sec"),
+                "end_sec": c.get("end_sec"),
+                "false_positive_risk": c.get("_raw", {}).get("false_positive_risk"),
+                "hook_type": c.get("_raw", {}).get("hook_type"),
+            }
+            for c in final_candidates
+            if (c.get("_raw", {}).get("false_positive_risk") or 0) > 0.5
+        ]
+
+        if not had_raw_signal and error:
+            main_reject_reason = error
+        elif not had_raw_signal:
+            main_reject_reason = "no_proposals_generated"
+        elif len(final_candidates) == 0:
+            main_reject_reason = "all_filtered_by_nms_or_score_threshold"
+        elif weak_hook_fallback_used:
+            main_reject_reason = "weak_hook_manual_review"
+
+        pipeline_trace.update({
+            "stage_proposals": raw_proposals_count,
+            "stage_after_nms": len(final_candidates),
+            "stage_rejected_hooks": len(rejected_hooks),
+            "proposal_sources": proposal_sources,
+            "weak_hook_fallback_used": weak_hook_fallback_used,
+            "micro_hook_active": micro_hook_active,
+        })
+
+    # ── Story-специфичная диагностика ────────────────────────────────────────
+    story_filter_reasons: Dict = {}
+    rejected_arcs: List[Dict] = []
+    beat_to_arc_trace: List[Dict] = []
+    weak_story_pool: List[Dict] = []
+    weak_story_fallback_used: bool = False
+
+    if mode == "story":
+        filter_counts: Dict = stats.get("filter_counts", {})
+        story_filter_reasons = filter_counts
+
+        total_filtered = sum(filter_counts.values()) if filter_counts else 0
+        rejected_count = total_filtered
+        had_raw_signal = total_filtered > 0 or len(final_candidates) > 0
+        raw_proposals_count = total_filtered + len(final_candidates) if filter_counts else None
+
+        # v1.1: новые сигналы из режима
+        rejected_arcs_from_mode = raw.get("rejected_arcs") or stats.get("rejected_arcs") or []
+        beat_to_arc_trace = raw.get("beat_to_arc_trace") or stats.get("beat_to_arc_trace") or []
+        weak_story_pool = raw.get("weak_story_pool") or stats.get("weak_story_pool") or []
+        weak_story_fallback_used = bool(
+            raw.get("weak_story_fallback_used") or stats.get("weak_story_fallback_used")
+        )
+
+        if filter_counts:
+            main_reject_reason = max(filter_counts, key=lambda k: filter_counts[k]) \
+                if any(filter_counts.values()) else error
+        elif error:
+            main_reject_reason = error
+        elif len(final_candidates) == 0:
+            main_reject_reason = "no_arcs_built_or_no_moments_passed_threshold"
+        elif weak_story_fallback_used:
+            main_reject_reason = "weak_story_manual_review"
+
+        arc_pattern_dist = stats.get("arc_pattern_distribution", {})
+        narrative_dist = stats.get("narrative_score_distribution", {})
+        story_filter_reasons = {
+            **filter_counts,
+            "_arc_pattern_distribution": arc_pattern_dist,
+            "_narrative_score_distribution": narrative_dist,
+            "_pipeline_mode": stats.get("pipeline_mode"),
+            "_threshold": stats.get("threshold"),
+            "_min_narrative_threshold": stats.get("min_narrative_threshold"),
+            "weak_story_fallback_used": weak_story_fallback_used,
+            "n_rejected_arcs": len(rejected_arcs_from_mode),
+            "n_weak_story_pool": len(weak_story_pool),
+        }
+        filter_reasons = story_filter_reasons
+
+        # Объединяем rejected_arcs из режима + финальные reject export_decisions
+        rejected_arcs = list(rejected_arcs_from_mode)
+        rejected_arcs.extend([
+            {
+                "id": c.get("id"),
+                "start_sec": c.get("start_sec"),
+                "end_sec": c.get("end_sec"),
+                "score": c.get("score"),
+                "story_type": c.get("_raw", {}).get("story_type"),
+                "export_decision": c.get("_raw", {}).get("export_decision"),
+                "export_reject_reasons": c.get("_raw", {}).get("export_reject_reasons", []),
+                "active_story_failures": c.get("_raw", {}).get("active_story_failures", []),
+            }
+            for c in final_candidates
+            if c.get("_raw", {}).get("export_decision") == "reject"
+        ])
+
+        pipeline_trace.update({
+            "stage_events": stats.get("stage_events_count"),
+            "stage_beats": stats.get("stage_beats_count"),
+            "stage_arcs": stats.get("stage_arcs_count"),
+            "stage_moments_all": raw_proposals_count,
+            "stage_top_k": len(final_candidates),
+            "stage_weak_story_pool": len(weak_story_pool),
+            "stage_rejected_arcs": len(rejected_arcs_from_mode),
+            "pipeline_mode": stats.get("pipeline_mode"),
+            "filter_counts": filter_counts,
+            "weak_story_fallback_used": weak_story_fallback_used,
+        })
+
+    # ── Trailer-специфичная диагностика ──────────────────────────────────────
+    input_candidate_library: List[Dict] = []
+    rejected_trailer_candidates: List[Dict] = []
+    trailer_filter_reasons: Dict = {}
+    theme_blocks: List[Dict] = []
+    transition_scores: List[Dict] = []
+    slot_assignment_before_nms: List[Dict] = []
+    slot_assignment_after_nms: List[Dict] = []
+    duplicate_removed: List[Dict] = []
+    overlap_removed: List[Dict] = []
+    duration_cap_trace: Dict = {}
+    final_sequence_validation: Dict = {}
+    is_degraded_preview: bool = False
+
+    if mode == "trailer_preview":
+        # v3.1: режим теперь сам отдаёт input_candidate_library
+        input_candidate_library = raw.get("input_candidate_library") or []
+        if not input_candidate_library:
+            # Fallback: собираем из mode-специфичных полей
+            for mode_key in ("hook_moments", "story_moments", "viral_moments", "educational_moments"):
+                for m in raw.get(mode_key, []):
+                    input_candidate_library.append({**m, "_source_mode": mode_key.replace("_moments", "")})
+
+        raw_proposals_count = len(input_candidate_library)
+        had_raw_signal = raw_proposals_count > 0
+
+        # v3.1: новые debug artifacts
+        slot_assignment_before_nms = raw.get("slot_assignment_before_nms") or []
+        slot_assignment_after_nms = raw.get("slot_assignment_after_nms") or []
+        duplicate_removed = raw.get("duplicate_removed") or []
+        overlap_removed = raw.get("overlap_removed") or []
+        duration_cap_trace = raw.get("duration_cap_trace") or {}
+        final_sequence_validation = raw.get("final_sequence_validation") or {}
+        is_degraded_preview = bool(raw.get("is_degraded_preview"))
+
+        # rejected: всё из input_library, чего нет в final_candidates
+        rejected_trailer_candidates = [
+            c for c in input_candidate_library
+            if not any(
+                abs(c.get("start", c.get("start_sec", 0)) - f.get("start_sec", 0)) < 1.0
+                for f in final_candidates
+            )
+        ]
+        rejected_count = len(rejected_trailer_candidates)
+
+        trailer_filter_reasons = {
+            "n_input_candidates": raw_proposals_count,
+            "n_rejected": rejected_count,
+            "n_duplicates_removed": len(duplicate_removed),
+            "n_overlaps_removed": len(overlap_removed),
+            "avg_transition_score": stats.get("avg_transition_score"),
+            "num_themes": stats.get("num_themes"),
+            "spoiler_agg": stats.get("spoiler_agg"),
+            "is_degraded_preview": is_degraded_preview,
+            "effective_target_duration": duration_cap_trace.get("effective_target_duration"),
+            "assembled_total_duration": final_sequence_validation.get("total_duration"),
+            "video_duration": duration_cap_trace.get("video_duration"),
+        }
+        filter_reasons = trailer_filter_reasons
+
+        if len(final_candidates) == 0:
+            if raw_proposals_count == 0:
+                main_reject_reason = "no_input_candidates_from_other_modes"
+            else:
+                main_reject_reason = "all_trailer_candidates_filtered"
+        elif is_degraded_preview:
+            main_reject_reason = "degraded_preview_hook_or_story_missing"
+        elif final_sequence_validation.get("total_duration", 0) > (
+            duration_cap_trace.get("effective_target_duration") or float("inf")
+        ):
+            main_reject_reason = "assembled_duration_exceeds_target"
+        elif not main_reject_reason:
+            main_reject_reason = None
+
+        theme_blocks = raw.get("theme_blocks", [])
+        transition_scores = [
+            {"from": e.get("from"), "to": e.get("to"), "score": e.get("score")}
+            for e in raw.get("transition_edges", [])
+        ]
+
+        pipeline_trace.update({
+            "stage_input_library": raw_proposals_count,
+            "stage_slots_before_nms": len(slot_assignment_before_nms),
+            "stage_slots_after_nms": len(slot_assignment_after_nms),
+            "stage_duplicates_removed": len(duplicate_removed),
+            "stage_overlaps_removed": len(overlap_removed),
+            "stage_final": len(final_candidates),
+            "theme_blocks_count": len(theme_blocks),
+            "is_degraded_preview": is_degraded_preview,
+            "effective_target_duration": duration_cap_trace.get("effective_target_duration"),
+            "assembled_duration": final_sequence_validation.get("total_duration"),
+        })
+
+    # ── Viral-специфичная диагностика ────────────────────────────────────────
+    viral_feature_breakdown: List[Dict] = []
+    if mode == "viral":
+        moments_key = "viral_moments"
+        all_raw_moments = raw.get(moments_key, []) if isinstance(raw, dict) else []
+        if not raw_proposals_count:
+            raw_proposals_count = len(all_raw_moments)
+            raw_proposals = list(all_raw_moments)
+            had_raw_signal = raw_proposals_count > 0
+        if len(final_candidates) == 0:
+            main_reject_reason = error or "no_moments_passed_threshold"
+
+        viral_feature_breakdown = [
+            {
+                "id": c.get("id"),
+                "start_sec": c.get("start_sec"),
+                "end_sec": c.get("end_sec"),
+                "virality_score": c.get("score"),
+                "breakdown": c.get("_raw", {}).get("viral_feature_breakdown", {}),
+                "semantic_score": c.get("_raw", {}).get("semantic_score"),
+                "visual_score": c.get("_raw", {}).get("visual_score"),
+                "audio_score": c.get("_raw", {}).get("audio_score"),
+            }
+            for c in final_candidates
+        ]
+
+        pipeline_trace.update({
+            "stage_raw_moments": raw_proposals_count,
+            "stage_top_k": len(final_candidates),
+            "n_with_feature_breakdown": sum(
+                1 for v in viral_feature_breakdown if v.get("breakdown")
+            ),
+        })
+
+    # ── Educational-специфичная диагностика ──────────────────────────────────
+    topic_segments_out: List[Dict] = []
+    educational_windows: List[Dict] = []
+    educational_scores: List[Dict] = []
+    topic_source: Optional[str] = None
+    if mode == "educational":
+        moments_key = "educational_moments"
+        all_raw_moments = raw.get(moments_key, []) if isinstance(raw, dict) else []
+        if not raw_proposals_count:
+            raw_proposals_count = len(all_raw_moments)
+            raw_proposals = list(all_raw_moments)
+            had_raw_signal = raw_proposals_count > 0
+        if len(final_candidates) == 0:
+            main_reject_reason = error or "no_moments_passed_threshold"
+
+        topic_segments_out = raw.get("topic_segments") or []
+        educational_windows = raw.get("educational_windows") or []
+        educational_scores = raw.get("educational_scores") or []
+        topic_source = raw.get("topic_source")
+
+        pipeline_trace.update({
+            "stage_raw_moments": raw_proposals_count,
+            "stage_top_k": len(final_candidates),
+            "stage_topics": len(topic_segments_out),
+            "stage_windows": len(educational_windows),
+            "topic_source": topic_source,
+        })
+
+    return {
+        # Универсальные
+        "raw_proposals": raw_proposals,
+        "rejected_candidates": rejected_candidates,
+        "filter_reasons": filter_reasons,
+        "pipeline_trace": pipeline_trace,
+        "raw_proposals_count": raw_proposals_count,
+        "rejected_count": rejected_count,
+        "main_reject_reason": main_reject_reason,
+        "had_raw_signal": had_raw_signal,
+        # Hook-специфичные
+        "hook_proposals": hook_proposals,
+        "hook_filter_reasons": hook_filter_reasons,
+        "visual_first_candidates": visual_first_candidates,
+        "non_hook_risks": non_hook_risks,
+        "rejected_hooks": rejected_hooks,
+        "weak_hook_fallback_used": weak_hook_fallback_used,
+        "micro_hook_active": micro_hook_active,
+        # Story-специфичные
+        "story_filter_reasons": story_filter_reasons,
+        "rejected_arcs": rejected_arcs,
+        "beat_to_arc_trace": beat_to_arc_trace,
+        "weak_story_pool": weak_story_pool,
+        "weak_story_fallback_used": weak_story_fallback_used,
+        # Viral-специфичные
+        "viral_feature_breakdown": viral_feature_breakdown,
+        # Educational-специфичные
+        "topic_segments": topic_segments_out,
+        "educational_windows": educational_windows,
+        "educational_scores": educational_scores,
+        "topic_source": topic_source,
+        # Trailer-специфичные
+        "input_candidate_library": input_candidate_library,
+        "rejected_trailer_candidates": rejected_trailer_candidates,
+        "trailer_filter_reasons": trailer_filter_reasons,
+        "theme_blocks": theme_blocks,
+        "transition_scores": transition_scores,
+        "slot_assignment_before_nms": slot_assignment_before_nms,
+        "slot_assignment_after_nms": slot_assignment_after_nms,
+        "duplicate_removed": duplicate_removed,
+        "overlap_removed": overlap_removed,
+        "duration_cap_trace": duration_cap_trace,
+        "final_sequence_validation": final_sequence_validation,
+        "is_degraded_preview": is_degraded_preview,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Главный прогон одного run
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1006,12 +1509,41 @@ def run_single(
     _save_json(run_dir / "export_decision.json", {"decision": export_decision})
     _save_json(run_dir / "boundary_diagnostics.json", boundary_diag)
 
+    # ── Debug artifacts ───────────────────────────────────────────────────────
+    raw_output = mode_result.get("_raw_mode_output") or _rebuild_raw(mode, mode_result)
+    dbg = _extract_debug_artifacts(mode, raw_output, candidates, asr_segments or [])
+
+    _save_json(run_dir / "raw_proposals.json", dbg["raw_proposals"])
+    _save_json(run_dir / "rejected_candidates.json", dbg["rejected_candidates"])
+    _save_json(run_dir / "filter_reasons.json", dbg["filter_reasons"])
+    _save_json(run_dir / "pipeline_trace.json", dbg["pipeline_trace"])
+
     # Режим-специфичные артефакты
+    if mode == "hook":
+        _save_json(run_dir / "hook_proposals.json", dbg["hook_proposals"])
+        _save_json(run_dir / "hook_filter_reasons.json", dbg["hook_filter_reasons"])
+        _save_json(run_dir / "visual_first_candidates.json", dbg["visual_first_candidates"])
+        _save_json(run_dir / "non_hook_risks.json", dbg["non_hook_risks"])
+        _save_json(run_dir / "rejected_hooks.json", dbg["rejected_hooks"])
+
     if mode == "story":
         _save_json(run_dir / "story_events.json", mode_result.get("story_events", []))
         _save_json(run_dir / "beats.json", mode_result.get("beats", []))
         _save_json(run_dir / "arcs.json", mode_result.get("arcs", []))
         _save_json(run_dir / "role_probs.json", mode_result.get("role_probs", {}))
+        _save_json(run_dir / "rejected_arcs.json", dbg["rejected_arcs"])
+        _save_json(run_dir / "story_filter_reasons.json", dbg["story_filter_reasons"])
+        _save_json(run_dir / "beat_to_arc_trace.json", dbg["beat_to_arc_trace"])
+        _save_json(run_dir / "weak_story_pool.json", dbg["weak_story_pool"])
+
+    if mode == "viral":
+        _save_json(run_dir / "viral_feature_breakdown.json", dbg["viral_feature_breakdown"])
+
+    if mode == "educational":
+        _save_json(run_dir / "topic_segments.json", dbg["topic_segments"])
+        _save_json(run_dir / "educational_windows.json", dbg["educational_windows"])
+        _save_json(run_dir / "educational_scores.json", dbg["educational_scores"])
+        _save_json(run_dir / "topic_source.json", {"topic_source": dbg["topic_source"]})
 
     if mode == "trailer_preview":
         _save_json(run_dir / "themes.json", mode_result.get("themes", []))
@@ -1019,6 +1551,22 @@ def run_single(
         _save_json(run_dir / "transition_graph.json", mode_result.get("transition_graph", {}))
         _save_json(run_dir / "assembly_plan.json", mode_result.get("assembly_plan", {}))
         _save_json(run_dir / "ui_payload.json", mode_result.get("ui_payload", {}))
+        _save_json(run_dir / "input_candidate_library.json", dbg["input_candidate_library"])
+        _save_json(run_dir / "rejected_trailer_candidates.json", dbg["rejected_trailer_candidates"])
+        _save_json(run_dir / "trailer_filter_reasons.json", dbg["trailer_filter_reasons"])
+        _save_json(run_dir / "theme_blocks.json", dbg["theme_blocks"])
+        _save_json(run_dir / "transition_scores.json", dbg["transition_scores"])
+        # v3.1: новые артефакты
+        _save_json(run_dir / "slot_assignment_before_nms.json", dbg["slot_assignment_before_nms"])
+        _save_json(run_dir / "slot_assignment_after_nms.json", dbg["slot_assignment_after_nms"])
+        _save_json(run_dir / "duplicate_removed.json", dbg["duplicate_removed"])
+        _save_json(run_dir / "overlap_removed.json", dbg["overlap_removed"])
+        _save_json(run_dir / "duration_cap_trace.json", dbg["duration_cap_trace"])
+        _save_json(run_dir / "final_sequence_validation.json", dbg["final_sequence_validation"])
+        _save_json(
+            run_dir / "degraded_preview_flag.json",
+            {"is_degraded_preview": dbg["is_degraded_preview"]},
+        )
 
     # ── 4. Экспорт клипа ──────────────────────────────────────────────────────
     export_sec = 0.0
@@ -1041,6 +1589,11 @@ def run_single(
 
     adapter_error = mode_result.get("adapter_error")
 
+    raw_proposals_count = dbg["raw_proposals_count"]
+    rejected_count = dbg["rejected_count"]
+    main_reject_reason = dbg["main_reject_reason"]
+    had_raw_signal = dbg["had_raw_signal"]
+
     runtime_metrics = {
         "run_id": run_id,
         "video": video_path.name,
@@ -1062,13 +1615,20 @@ def run_single(
         "top1_score": top1_score,
         "export_decision": export_decision,
         "clip_exported": clip_exported,
+        # Debug-сигналы фильтрации
+        "raw_proposals_count": raw_proposals_count,
+        "rejected_count": rejected_count,
+        "main_reject_reason": main_reject_reason,
+        "had_raw_signal": had_raw_signal,
         # Режим-специфичные метрики
         **mode_metrics,
         # Русские лейблы (для удобства чтения)
         "_labels_ru": {k: METRIC_LABELS_RU.get(k, k) for k in [
             "runtime_total_sec", "yolo_sec", "mode_logic_sec", "export_sec",
             "vram_peak_mb", "gpu_available", "gpu_name", "num_candidates",
-            "top1_score", "export_decision", *mode_metrics.keys()
+            "top1_score", "export_decision",
+            "raw_proposals_count", "rejected_count", "main_reject_reason", "had_raw_signal",
+            *mode_metrics.keys()
         ]},
         # Уровень зрелости (авто)
         "_maturity_level": _estimate_maturity_level(mode, num_candidates, export_decision, is_stub),
@@ -1126,6 +1686,10 @@ def run_single(
         "top1_score": top1_score,
         "export_decision": export_decision,
         "clip_exported": clip_exported,
+        "raw_proposals_count": raw_proposals_count,
+        "rejected_count": rejected_count,
+        "main_reject_reason": main_reject_reason,
+        "had_raw_signal": had_raw_signal,
         "maturity_level": runtime_metrics["_maturity_level"],
         "output_dir": str(run_dir),
     }
@@ -1202,7 +1766,8 @@ def save_runtime_breakdown(rows: List[Dict], output_dir: Path) -> Path:
     fieldnames = [
         "video", "mode", "model", "stub",
         "runtime_total_sec", "yolo_sec", "mode_logic_sec", "export_sec",
-        "vram_peak_mb", "gpu_name", "num_candidates", "export_decision"
+        "vram_peak_mb", "gpu_name", "num_candidates", "export_decision",
+        "raw_proposals_count", "rejected_count", "main_reject_reason", "had_raw_signal",
     ]
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -1242,9 +1807,33 @@ def save_progress_report(rows: List[Dict], output_dir: Path) -> None:
         reject = sum(1 for r in mode_rows if r["export_decision"] == "reject")
         avg_runtime = np.mean([r["runtime_total_sec"] for r in mode_rows])
 
+        # Debug-сигналы фильтрации
+        zero_cands = [r for r in mode_rows if r["num_candidates"] == 0]
+        had_signal = sum(1 for r in zero_cands if r.get("had_raw_signal"))
+        no_signal = sum(1 for r in zero_cands if not r.get("had_raw_signal"))
+        avg_raw = np.mean([r["raw_proposals_count"] for r in mode_rows
+                           if r.get("raw_proposals_count") is not None]) \
+            if any(r.get("raw_proposals_count") is not None for r in mode_rows) else None
+
+        reject_reasons: Dict[str, int] = {}
+        for r in mode_rows:
+            reason = r.get("main_reject_reason")
+            if reason:
+                reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
+
         lines.append(f"  Среднее кандидатов: {avg_cands:.1f}")
-        lines.append(f"  Среднее время: {avg_runtime:.1f}s")
+        lines.append(f"  Среднее time: {avg_runtime:.1f}s")
         lines.append(f"  auto_export: {auto_export} | manual_review: {manual_review} | reject: {reject}")
+        if avg_raw is not None:
+            lines.append(f"  Среднее raw proposals: {avg_raw:.1f}")
+        if zero_cands:
+            lines.append(
+                f"  ⚠️  Прогонов с 0 кандидатов: {len(zero_cands)} "
+                f"(был сигнал: {had_signal}, пусто совсем: {no_signal})"
+            )
+        if reject_reasons:
+            top_reason = max(reject_reasons, key=reject_reasons.__getitem__)
+            lines.append(f"  Главная причина отсева: {top_reason} ({reject_reasons[top_reason]}x)")
 
         stub_count = sum(1 for r in mode_rows if r.get("stub", True))
         if stub_count == len(mode_rows):
