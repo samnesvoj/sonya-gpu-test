@@ -263,35 +263,15 @@ def run_asr(video_path: Path, whisper_model: str = "base") -> Tuple[List[Dict], 
 
 def _stub_result(mode: str, video_path: Path, base_analysis: Dict) -> Dict[str, Any]:
     """
-    Универсальная заглушка — имитирует структуру результата режима.
-    Используется когда реальный модуль не подключён.
+    Диагностическая заглушка — module absent or import failed.
+    stub=True = diagnostic error, NOT a result.
+    candidates=[] — NO fake candidates ever generated.
+    export_decision="reject" — stub output is never exported.
     """
-    dur = base_analysis.get("detections", [{}])
-    n_cands = max(3, len(dur) // 5)
-    candidates = []
-    video_dur = 0.0
-    cap = cv2.VideoCapture(str(video_path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    cap.release()
-    video_dur = total / fps if fps > 0 else 60.0
-
-    step = max(5.0, video_dur / (n_cands + 1))
-    for i in range(n_cands):
-        start = round(step * (i + 1), 2)
-        end = round(min(start + 8.0, video_dur), 2)
-        candidates.append({
-            "id": i + 1,
-            "start_sec": start,
-            "end_sec": end,
-            "score": round(0.9 - i * 0.12, 3),
-            "reason": f"stub_candidate_{mode}_{i+1}",
-            "source": "stub",
-        })
-
-    ranking = sorted(candidates, key=lambda x: x["score"], reverse=True)
-    top1 = ranking[0] if ranking else {}
-    export_decision = "manual_review"  # стаб всегда manual_review
+    candidates: List[Dict] = []
+    ranking: List[Dict] = []
+    top1: Dict = {}
+    export_decision = "reject"  # stub output is always rejected
 
     result: Dict[str, Any] = {
         "mode": mode,
@@ -374,6 +354,33 @@ def _stub_result(mode: str, video_path: Path, base_analysis: Dict) -> Dict[str, 
             "boring_risk": None,
         }
 
+    return result
+
+
+def _error_result(
+    mode: str,
+    adapter_error: str,
+    error_traceback: str,
+) -> Dict[str, Any]:
+    """
+    Runtime crash in a real mode module.
+    stub=True, candidates=[], export_decision=reject.
+    Full traceback stored for writing to error_traceback.txt in run_single.
+    NEVER generates fake candidates.
+    """
+    result: Dict[str, Any] = {
+        "mode": mode,
+        "stub": True,
+        "candidates": [],
+        "ranking": [],
+        "top1": {},
+        "export_decision": "reject",
+        "main_reject_reason": f"{mode}_real_module_error",
+        "adapter_error": adapter_error,
+        "error_traceback": error_traceback,
+        "boundary_diagnostics": {},
+        "mode_metrics": {},
+    }
     return result
 
 
@@ -551,11 +558,9 @@ def run_hook(
 
     except Exception as e:
         adapter_error = f"{type(e).__name__}: {e}"
-        logger.warning(f"[hook] реальный режим упал → stub. Ошибка: {adapter_error}")
-
-    result = _stub_result("hook", video_path, base_analysis)
-    result["adapter_error"] = adapter_error
-    return result, time.perf_counter() - t0
+        _tb = traceback.format_exc()
+        logger.error(f"[hook] REAL MODULE CRASHED — stub=True, candidates=[]\n{_tb}")
+        return _error_result("hook", adapter_error, _tb), time.perf_counter() - t0
 
 
 def run_story(
@@ -635,11 +640,9 @@ def run_story(
 
     except Exception as e:
         adapter_error = f"{type(e).__name__}: {e}"
-        logger.warning(f"[story] реальный режим упал → stub. Ошибка: {adapter_error}")
-
-    result = _stub_result("story", video_path, base_analysis)
-    result["adapter_error"] = adapter_error
-    return result, time.perf_counter() - t0
+        _tb = traceback.format_exc()
+        logger.error(f"[story] REAL MODULE CRASHED — stub=True, candidates=[]\n{_tb}")
+        return _error_result("story", adapter_error, _tb), time.perf_counter() - t0
 
 
 def run_viral(
@@ -700,11 +703,9 @@ def run_viral(
 
     except Exception as e:
         adapter_error = f"{type(e).__name__}: {e}"
-        logger.warning(f"[viral] реальный режим упал → stub. Ошибка: {adapter_error}")
-
-    result = _stub_result("viral", video_path, base_analysis)
-    result["adapter_error"] = adapter_error
-    return result, time.perf_counter() - t0
+        _tb = traceback.format_exc()
+        logger.error(f"[viral] REAL MODULE CRASHED — stub=True, candidates=[]\n{_tb}")
+        return _error_result("viral", adapter_error, _tb), time.perf_counter() - t0
 
 
 def run_educational(
@@ -761,11 +762,9 @@ def run_educational(
 
     except Exception as e:
         adapter_error = f"{type(e).__name__}: {e}"
-        logger.warning(f"[educational] реальный режим упал → stub. Ошибка: {adapter_error}")
-
-    result = _stub_result("educational", video_path, base_analysis)
-    result["adapter_error"] = adapter_error
-    return result, time.perf_counter() - t0
+        _tb = traceback.format_exc()
+        logger.error(f"[educational] REAL MODULE CRASHED — stub=True, candidates=[]\n{_tb}")
+        return _error_result("educational", adapter_error, _tb), time.perf_counter() - t0
 
 
 def run_trailer_preview(
@@ -862,11 +861,9 @@ def run_trailer_preview(
 
     except Exception as e:
         adapter_error = f"{type(e).__name__}: {e}"
-        logger.warning(f"[trailer_preview] реальный режим упал → stub. Ошибка: {adapter_error}")
-
-    result = _stub_result("trailer_preview", video_path, base_analysis)
-    result["adapter_error"] = adapter_error
-    return result, time.perf_counter() - t0
+        _tb = traceback.format_exc()
+        logger.error(f"[trailer_preview] REAL MODULE CRASHED — stub=True, candidates=[]\n{_tb}")
+        return _error_result("trailer_preview", adapter_error, _tb), time.perf_counter() - t0
 
 
 MODE_RUNNERS = {
@@ -1531,6 +1528,17 @@ def run_single(
     mode_metrics = mode_result.get("mode_metrics", {})
     is_stub = mode_result.get("stub", False)
 
+    # ── Error traceback: persist immediately if real module crashed ───────────
+    _error_tb = mode_result.get("error_traceback")
+    if _error_tb:
+        try:
+            (run_dir / "error_traceback.txt").write_text(
+                f"mode: {mode}\nadapter_error: {mode_result.get('adapter_error')}\n\n{_error_tb}",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
     _save_json(run_dir / "candidates.json", candidates)
     _save_json(run_dir / "ranking.json", ranking)
     _save_json(run_dir / "export_decision.json", {"decision": export_decision})
@@ -1543,7 +1551,14 @@ def run_single(
     _save_json(run_dir / "raw_proposals.json", dbg["raw_proposals"])
     _save_json(run_dir / "rejected_candidates.json", dbg["rejected_candidates"])
     _save_json(run_dir / "filter_reasons.json", dbg["filter_reasons"])
-    _save_json(run_dir / "pipeline_trace.json", dbg["pipeline_trace"])
+    # Inject error info into pipeline_trace so ChatGPT sees it
+    _pipeline_trace = dict(dbg["pipeline_trace"])
+    if _error_tb:
+        _pipeline_trace["stub_mode"] = True
+        _pipeline_trace["adapter_error"] = mode_result.get("adapter_error")
+        _pipeline_trace["error_traceback_saved"] = "error_traceback.txt"
+        _pipeline_trace["main_reject_reason"] = mode_result.get("main_reject_reason")
+    _save_json(run_dir / "pipeline_trace.json", _pipeline_trace)
 
     # Режим-специфичные артефакты
     if mode == "hook":
@@ -1913,6 +1928,8 @@ def main() -> None:
                         help="Папка для результатов")
     parser.add_argument("--skip-export", action="store_true",
                         help="Не нарезать клипы (только JSON-артефакты)")
+    parser.add_argument("--strict-real", action="store_true",
+                        help="Fail with exit code 1 if any mode ran as stub (real module crashed)")
     parser.add_argument("--whisper-model", default="base",
                         choices=["tiny", "base", "small", "medium", "large"],
                         help="Размер Whisper: tiny/base = быстро, small/medium = качественнее")
@@ -2022,6 +2039,30 @@ def main() -> None:
     logger.success(f"📋 progress_report.txt:      {output_dir / 'progress_report.txt'}")
     logger.success(f"\nДальше: заполни human_review_template.json в каждой run-папке")
     logger.success(f"{'='*60}")
+
+    # ── --strict-real: fail if any mode ran as stub ───────────────────────────
+    if getattr(args, "strict_real", False):
+        stub_rows = [r for r in all_rows if r.get("stub")]
+        if stub_rows:
+            stub_summary = ", ".join(
+                f"{r['video']}/{r['mode']}" for r in stub_rows
+            )
+            msg = (
+                f"\n{'='*60}\n"
+                f"REAL TEST FAILED: {len(stub_rows)} stub(s) detected\n"
+                f"  {stub_summary}\n"
+                f"Check error_traceback.txt in each run folder.\n"
+                f"{'='*60}"
+            )
+            logger.error(msg)
+            # Append to progress_report
+            pr_path = output_dir / "progress_report.txt"
+            try:
+                with open(pr_path, "a", encoding="utf-8") as _f:
+                    _f.write(msg + "\n")
+            except Exception:
+                pass
+            sys.exit(1)
 
 
 if __name__ == "__main__":
