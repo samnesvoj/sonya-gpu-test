@@ -2024,7 +2024,19 @@ def run_educational_mode_v5(
     selected = refine_clip_boundaries(selected, asr_segments, audio_global)
 
     # ── Build output ───────────────────────────────────────────────────────
-    out = build_educational_output(selected, topic_segments, analyzed, config, threshold)
+    _pipeline_trace = {
+        "stage_topics":                 len(topic_segments),
+        "stage_windows_before_fallback": _windows_before_fallback,
+        "stage_windows_after_fallback":  _windows_after_fallback,
+        "window_source":                 _window_source,
+        "micro_mode":                    _micro_mode,
+        "weak_edu_fallback_used":        _weak_edu_fallback_used,
+        "topic_source":                  topic_source,
+    }
+    out = build_educational_output(
+        selected, topic_segments, analyzed, config, threshold,
+        pipeline_trace=_pipeline_trace,
+    )
     out["topic_source"] = topic_source
     out["weak_edu_fallback_used"] = _weak_edu_fallback_used
     # v5.1: экспонируем topic_segments как отдельное поле для benchmark дампа
@@ -2080,6 +2092,7 @@ def build_educational_output(
     all_analyzed: List[Dict],
     config: Dict,
     threshold: float,
+    pipeline_trace: Optional[Dict] = None,
 ) -> Dict:
     moments = []
     for item in selected:
@@ -2135,6 +2148,7 @@ def build_educational_output(
         for i, t in enumerate(topic_segments)
     ]
 
+    _pt = pipeline_trace or {}
     scores_list = [a["score"].final_score for a in all_analyzed if a["score"].eligible]
     stats = {
         "num_topics": len(topic_segments),
@@ -2149,13 +2163,14 @@ def build_educational_output(
         "has_real_visual_data": bool(all_analyzed and any(
             a["visual"].person_present_ratio != 0.5 for a in all_analyzed
         )),
-        # pipeline trace (v5.2)
-        "stage_topics": len(topic_segments),
-        "stage_windows_before_fallback": _windows_before_fallback,
-        "stage_windows_after_fallback": _windows_after_fallback,
-        "window_source": _window_source,
-        "micro_mode": _micro_mode,
-        "weak_edu_fallback_used": _weak_edu_fallback_used,
+        # pipeline trace (v5.2) — passed explicitly, never read from outer scope
+        "stage_topics":                  _pt.get("stage_topics", len(topic_segments)),
+        "stage_windows_before_fallback": _pt.get("stage_windows_before_fallback", 0),
+        "stage_windows_after_fallback":  _pt.get("stage_windows_after_fallback", len(all_analyzed)),
+        "window_source":                 _pt.get("window_source", "unknown"),
+        "micro_mode":                    _pt.get("micro_mode", False),
+        "weak_edu_fallback_used":        _pt.get("weak_edu_fallback_used", False),
+        "topic_source":                  _pt.get("topic_source", "unknown"),
     }
 
     # diagnostics payload (attached as _diagnostics, stripped in export_cleaned)
