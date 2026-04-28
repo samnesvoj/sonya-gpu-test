@@ -4160,6 +4160,7 @@ def find_hook_moments(
                                    f"(reject_reason={wk.get('reject_reason')})",
                         "weight": 0.4,
                     }],
+                    "intensity": round(float(wk.get("intensity", 0.0)), 3),
                     "export_decision": "manual_review",
                     "reject_reason_original": wk.get("reject_reason"),
                     "transcript_preview": wk.get("transcript_preview", ""),
@@ -4260,7 +4261,7 @@ def find_hook_moments(
                 "avg_score":                round(avg_score, 3),
                 "avg_confidence":           round(avg_confidence, 3),
                 "max_hook_score":           round(max(m["hook_score"] for m in hook_candidates), 3),
-                "avg_intensity":            round(float(np.mean([m["intensity"] for m in hook_candidates])), 3),
+                "avg_intensity":            round(float(np.mean([m.get("intensity", 0.0) for m in hook_candidates])), 3),
                 "n_candidates_before_nms":  n_before_nms,
                 # v2.0 quality summary
                 "avg_false_positive_risk":  round(

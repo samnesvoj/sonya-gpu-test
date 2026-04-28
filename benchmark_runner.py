@@ -130,6 +130,15 @@ def run_yolo_analysis(
     Возвращает (base_analysis_dict, elapsed_sec).
     """
     t0 = time.perf_counter()
+
+    # real_visual_metrics: optical flow + face detection per frame (опционально)
+    try:
+        from real_visual_metrics import compute_all_frame_metrics as _real_visual_fn
+        _has_real_visual = True
+    except ImportError:
+        _real_visual_fn = None
+        _has_real_visual = False
+
     try:
         from ultralytics import YOLO
 
@@ -148,6 +157,7 @@ def run_yolo_analysis(
 
         detections = []
         frame_idx = 0
+        _prev_gray = None  # для optical flow
         while frame_idx < total_frames:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
@@ -161,6 +171,7 @@ def run_yolo_analysis(
                 "objects": [],
                 "confidence_max": 0.0,
             }
+            yolo_dets_for_visual = []
             for r in results:
                 for box in r.boxes:
                     cls_id = int(box.cls[0])
@@ -170,6 +181,21 @@ def run_yolo_analysis(
                     if cls_name == "person":
                         det["person_count"] += 1
                     det["confidence_max"] = max(det["confidence_max"], conf)
+                    if hasattr(box, "xyxy"):
+                        xy = box.xyxy[0].cpu().numpy().tolist()
+                        yolo_dets_for_visual.append({"bbox": xy})
+
+            # Реальные визуальные метрики (optical flow, faces, rule-of-thirds)
+            if _has_real_visual and _real_visual_fn is not None:
+                try:
+                    vm = _real_visual_fn(frame, _prev_gray, yolo_dets_for_visual)
+                    det["action_intensity"] = round(vm["action_intensity"], 4)
+                    det["emotional_peaks"] = round(vm["emotional_peaks"], 4)
+                    det["composition_score"] = round(vm["composition_score"], 4)
+                    _prev_gray = vm["current_gray"]
+                except Exception:
+                    _prev_gray = None
+
             detections.append(det)
             frame_idx += sample_step
         cap.release()
@@ -183,6 +209,7 @@ def run_yolo_analysis(
             "avg_confidence": round(
                 np.mean([d["confidence_max"] for d in detections]) if detections else 0, 3
             ),
+            "has_real_visual_metrics": _has_real_visual,
             "detections": detections,
         }, elapsed
 

@@ -1796,6 +1796,24 @@ def run_educational_mode_v5(
     # ── Step 6: filter + dedup ─────────────────────────────────────────────
     logger.info("Step 6/8: Filtering and deduplicating...")
     above_threshold = [a for a in analyzed if a["score"].final_score >= threshold and a["score"].eligible]
+
+    # Fallback: если threshold убил всё, но eligible-окна есть → top-3 как manual_review
+    _weak_edu_fallback_used = False
+    if not above_threshold:
+        eligible_all = [a for a in analyzed if a["score"].eligible]
+        if eligible_all:
+            weak_pool = sorted(eligible_all, key=lambda a: a["score"].final_score, reverse=True)[:3]
+            for a in weak_pool:
+                a["_weak_edu_fallback"] = True
+            above_threshold = weak_pool
+            _weak_edu_fallback_used = True
+            logger.warning(
+                f"Educational threshold={threshold:.3f} killed all candidates. "
+                f"Promoting top-{len(weak_pool)} eligible windows as manual_review fallback."
+            )
+        else:
+            logger.warning("Educational: 0 eligible windows even before threshold — no output.")
+
     deduped = deduplicate_windows(above_threshold)
 
     # ── Step 7: coverage-based selection ──────────────────────────────────
@@ -1813,6 +1831,7 @@ def run_educational_mode_v5(
     # ── Build output ───────────────────────────────────────────────────────
     out = build_educational_output(selected, topic_segments, analyzed, config, threshold)
     out["topic_source"] = topic_source
+    out["weak_edu_fallback_used"] = _weak_edu_fallback_used
     # v5.1: экспонируем topic_segments как отдельное поле для benchmark дампа
     out["topic_segments"] = [
         {k: v for k, v in t.items() if k != "asr_indices"}
@@ -1905,6 +1924,8 @@ def build_educational_output(
             "has_formula": sem.has_formula,
             "has_example": sem.has_example,
             "has_steps": sem.has_steps,
+            "export_decision": "manual_review" if item.get("_weak_edu_fallback") else "auto_export",
+            "is_weak_edu_fallback": bool(item.get("_weak_edu_fallback")),
         })
 
     moments.sort(key=lambda m: (m["topic_id"], m["start"]))
