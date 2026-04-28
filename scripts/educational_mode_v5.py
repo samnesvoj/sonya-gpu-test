@@ -1261,6 +1261,150 @@ def build_topic_windows(
     return windows
 
 
+def merge_short_topics_into_windows(
+    topic_segments: List[Dict],
+    asr_segments: Optional[List[Dict]] = None,
+    min_window: float = 20.0,
+    max_window: float = 45.0,
+    overlap: float = 7.0,
+) -> List[Dict]:
+    """
+    Fallback 1: merge adjacent short topics into windows of min_window..max_window sec.
+    Called when all topics are shorter than min_clip_duration and build_topic_windows → 0.
+
+    Algorithm:
+      - Walk sorted topics left-to-right, accumulate until span >= min_window.
+      - Cap at max_window. Emit window.
+      - Next window starts at (current_end - overlap) to preserve continuity.
+    """
+    if not topic_segments:
+        return []
+
+    sorted_topics = sorted(topic_segments, key=lambda t: float(t.get("start", 0.0)))
+    windows: List[Dict] = []
+    seen: set = set()
+    n = len(sorted_topics)
+
+    i = 0
+    while i < n:
+        t_start = float(sorted_topics[i].get("start", 0.0))
+        t_end = float(sorted_topics[i].get("end", t_start))
+        topic_id = int(sorted_topics[i].get("topic_id", i))
+        merged_title = str(sorted_topics[i].get("title", f"Topic {i + 1}"))
+        merged_kw: List[str] = list(sorted_topics[i].get("keywords", []))
+
+        j = i
+        while j < n:
+            t_end = float(sorted_topics[j].get("end", t_end))
+            merged_kw.extend(sorted_topics[j].get("keywords", []))
+            if t_end - t_start >= min_window:
+                break
+            j += 1
+
+        # cap at max_window
+        if t_end - t_start > max_window:
+            t_end = t_start + max_window
+
+        dur = t_end - t_start
+        if dur >= min_window * 0.6:  # allow slightly shorter at video edges
+            key = (round(t_start, 1), round(t_end, 1))
+            if key not in seen:
+                seen.add(key)
+                windows.append({
+                    "start": t_start,
+                    "end": t_end,
+                    "duration": dur,
+                    "topic_id": topic_id,
+                    "topic_title": merged_title,
+                    "topic_keywords": list(dict.fromkeys(merged_kw))[:8],
+                    "window_scale": dur,
+                    "_source": "merged_short_topics",
+                })
+
+        # advance: next window starts at (t_end - overlap)
+        next_start = t_end - overlap
+        new_i = j + 1
+        for k in range(i, n):
+            if float(sorted_topics[k].get("end", 0.0)) > next_start:
+                new_i = k
+                break
+        i = max(new_i, i + 1)
+
+    return windows
+
+
+def build_asr_fallback_windows(
+    asr_segments: List[Dict],
+    min_window: float = 8.0,
+    max_window: float = 35.0,
+    step: float = 5.0,
+    video_duration: Optional[float] = None,
+) -> List[Dict]:
+    """
+    Fallback 2: build windows directly from ASR segments when topic-based
+    approaches yield 0 windows.  Groups consecutive segments into sliding
+    windows of min_window..max_window seconds.
+
+    Each returned dict has _source="asr_fallback_windows" so benchmark and
+    ChatGPT can identify the source in diagnostics.
+    """
+    if not asr_segments:
+        return []
+
+    sorted_segs = sorted(asr_segments, key=lambda s: float(s.get("start", 0.0)))
+    total_end = float(
+        video_duration
+        or max((s.get("end", 0.0) for s in sorted_segs), default=0.0)
+    )
+    if total_end <= 0:
+        return []
+
+    windows: List[Dict] = []
+    seen: set = set()
+
+    pos = float(sorted_segs[0].get("start", 0.0))
+    while pos < total_end:
+        win_end_target = pos + max_window
+        # grab all segments that start within the window (+ small grace)
+        in_range = [
+            s for s in sorted_segs
+            if float(s.get("start", 0.0)) >= pos - 0.5
+            and float(s.get("end", 0.0)) <= win_end_target + 3.0
+        ]
+        if not in_range:
+            pos += step
+            continue
+
+        actual_end = min(
+            float(max(s.get("end", pos) for s in in_range)),
+            win_end_target,
+        )
+        dur = actual_end - pos
+
+        if dur >= min_window:
+            key = (round(pos, 1), round(actual_end, 1))
+            if key not in seen:
+                seen.add(key)
+                asr_text_preview = " ".join(
+                    str(s.get("text", "")) for s in in_range[:5]
+                )[:80]
+                windows.append({
+                    "start": pos,
+                    "end": actual_end,
+                    "duration": dur,
+                    "topic_id": 0,
+                    "topic_title": "ASR Window",
+                    "topic_keywords": [],
+                    "window_scale": dur,
+                    "_source": "asr_fallback_windows",
+                    "_asr_preview": asr_text_preview,
+                })
+
+        pos += step
+
+    return windows
+
+
 def collect_window_context(
     window: Dict,
     asr_segments: Optional[List[Dict]],
@@ -1758,8 +1902,59 @@ def run_educational_mode_v5(
 
     # ── Step 3: build windows ──────────────────────────────────────────────
     logger.info("Step 3/8: Building windows...")
-    windows = build_topic_windows(topic_segments, config)
-    logger.info(f"  Generated {len(windows)} candidate windows")
+
+    # micro_educational: video < 3 min → allow smaller windows (8–45 s)
+    _video_dur = audio_global.duration_sec
+    _micro_mode = _video_dur < 180.0
+    if _micro_mode:
+        logger.info(f"  micro_educational mode (video={_video_dur:.1f}s < 180s): lowering min_clip_duration → 8s")
+    _build_config = dict(config)
+    if _micro_mode:
+        _build_config["min_clip_duration"] = 8.0
+        _build_config["window_size_range"] = (8, 45)
+
+    windows = build_topic_windows(topic_segments, _build_config)
+    _windows_before_fallback = len(windows)
+    _window_source = "topic_windows"
+
+    # Fallback 1: merge adjacent short topics into valid-size windows
+    if not windows and topic_segments:
+        logger.warning(
+            f"  build_topic_windows → 0 (all topics shorter than min_clip_duration). "
+            f"Trying merge_short_topics_into_windows..."
+        )
+        _min_win = 10.0 if _micro_mode else 20.0
+        _max_win = 45.0
+        windows = merge_short_topics_into_windows(
+            topic_segments, asr_segments,
+            min_window=_min_win, max_window=_max_win, overlap=7.0,
+        )
+        if windows:
+            _window_source = "merged_short_topics"
+            logger.info(f"  Merge fallback: {len(windows)} windows (source=merged_short_topics)")
+
+    # Fallback 2: build directly from ASR segments
+    if not windows and asr_segments:
+        logger.warning(
+            f"  merge_short_topics → 0 as well. "
+            f"Falling back to ASR-direct windows (source=asr_fallback_windows)..."
+        )
+        _min_win = 8.0 if _micro_mode else 15.0
+        _max_win = 35.0 if _micro_mode else 60.0
+        windows = build_asr_fallback_windows(
+            asr_segments,
+            min_window=_min_win, max_window=_max_win, step=5.0,
+            video_duration=_video_dur,
+        )
+        if windows:
+            _window_source = "asr_fallback_windows"
+            logger.warning(f"  ASR fallback: {len(windows)} windows")
+
+    _windows_after_fallback = len(windows)
+    logger.info(
+        f"  Windows: before_fallback={_windows_before_fallback}  "
+        f"after_fallback={_windows_after_fallback}  source={_window_source}"
+    )
 
     # ── Step 4: analyze all windows ───────────────────────────────────────
     logger.info("Step 4/8: Analyzing windows...")
@@ -1954,6 +2149,13 @@ def build_educational_output(
         "has_real_visual_data": bool(all_analyzed and any(
             a["visual"].person_present_ratio != 0.5 for a in all_analyzed
         )),
+        # pipeline trace (v5.2)
+        "stage_topics": len(topic_segments),
+        "stage_windows_before_fallback": _windows_before_fallback,
+        "stage_windows_after_fallback": _windows_after_fallback,
+        "window_source": _window_source,
+        "micro_mode": _micro_mode,
+        "weak_edu_fallback_used": _weak_edu_fallback_used,
     }
 
     # diagnostics payload (attached as _diagnostics, stripped in export_cleaned)
