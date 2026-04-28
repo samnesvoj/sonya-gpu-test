@@ -3714,6 +3714,39 @@ def find_hook_moments(
     cfg = config or HookModeConfig()
     eff_min_hook_score, eff_threshold = _get_effective_thresholds(cfg)
 
+    # v2.1: AUTO-RELAX для коротких/средних видео (micro-hook)
+    #   video < 30s  → min_hook_duration=1.5, threshold -= 0.10  (micro-hook)
+    #   30 ≤ dur < 90s → threshold -= 0.05                       (relaxed)
+    #   ≥ 90s → стандартные пороги
+    micro_hook_active = False
+    if video_duration_sec < 30.0:
+        micro_hook_active = True
+        cfg.min_hook_duration = min(cfg.min_hook_duration, 1.5)
+        cfg.hook_window_sec = min(cfg.hook_window_sec, max(video_duration_sec * 0.6, 5.0))
+        eff_min_hook_score = max(0.25, eff_min_hook_score - 0.10)
+        eff_threshold = max(0.30, eff_threshold - 0.10)
+        logger.info(
+            f"micro_hook auto-activated (video={video_duration_sec:.1f}s): "
+            f"min_duration={cfg.min_hook_duration:.1f}s, "
+            f"window={cfg.hook_window_sec:.1f}s, "
+            f"min_hook_score={eff_min_hook_score:.2f}, threshold={eff_threshold:.2f}"
+        )
+    elif video_duration_sec < 90.0:
+        eff_min_hook_score = max(0.30, eff_min_hook_score - 0.05)
+        eff_threshold = max(0.35, eff_threshold - 0.05)
+        logger.info(
+            f"medium-video relaxed thresholds: "
+            f"min_hook_score={eff_min_hook_score:.2f}, threshold={eff_threshold:.2f}"
+        )
+
+    # v2.1: отслеживаем rejected кандидатов для diagnostics
+    rejected_hooks: List[Dict] = []
+    hook_filter_reasons: Dict[str, int] = {
+        "too_short_transcript": 0,
+        "low_hook_score": 0,
+        "low_final_score": 0,
+    }
+
     if cfg.loose_hook_mode:
         logger.info(
             f"loose_hook_mode: eff_min_hook_score={eff_min_hook_score:.2f}, "
@@ -3787,6 +3820,14 @@ def find_hook_moments(
             win_transcript = " ".join(s.get("text", "") for s in win_segs).strip()
 
             if len(win_transcript.split()) < 4:
+                hook_filter_reasons["too_short_transcript"] += 1
+                rejected_hooks.append({
+                    "start": win_start, "end": win_end,
+                    "proposal_source": proposal_source,
+                    "reject_reason": "too_short_transcript",
+                    "word_count": len(win_transcript.split()),
+                    "transcript_preview": win_transcript[:80],
+                })
                 continue
 
             # ── 2. Feature extraction ─────────────────────────────────────────
@@ -3835,6 +3876,16 @@ def find_hook_moments(
                 # relaxed threshold.  The penalty layer and final scoring will
                 # still down-rank them if the full picture is weak.
                 if not (is_visual_first and delivery_proxy >= 0.52):
+                    hook_filter_reasons["low_hook_score"] += 1
+                    rejected_hooks.append({
+                        "start": win_start, "end": win_end,
+                        "proposal_source": proposal_source,
+                        "reject_reason": "low_hook_score",
+                        "hook_score": round(float(hook_score), 3),
+                        "threshold": round(float(eff_min_hook_score), 3),
+                        "delivery_proxy": round(float(delivery_proxy), 3),
+                        "transcript_preview": win_transcript[:80],
+                    })
                     continue
 
             # ── 3. Sub-scores ─────────────────────────────────────────────────
@@ -3920,6 +3971,17 @@ def find_hook_moments(
             )
 
             if final_score < eff_threshold:
+                hook_filter_reasons["low_final_score"] += 1
+                rejected_hooks.append({
+                    "start": win_start, "end": win_end,
+                    "proposal_source": proposal_source,
+                    "reject_reason": "low_final_score",
+                    "final_score": round(float(final_score), 3),
+                    "hook_score": round(float(hook_score), 3),
+                    "threshold": round(float(eff_threshold), 3),
+                    "hook_type_soft": str(hook_type) if "hook_type" in dir() else "",
+                    "transcript_preview": win_transcript[:80],
+                })
                 continue
 
             # ── 8. Boundary refinement ────────────────────────────────────────
@@ -4070,9 +4132,60 @@ def find_hook_moments(
         hook_candidates = _temporal_nms(hook_candidates, iou_thresh=cfg.nms_iou_thresh)
         hook_candidates = hook_candidates[:top_k]
 
+        # v2.1: WEAK-HOOK FALLBACK — если все отфильтровались, но raw сигнал был,
+        # вернём top-3 weak-candidates как manual_review (reason=weak_hook_manual_review)
+        weak_hook_fallback_used = False
+        if not hook_candidates and rejected_hooks:
+            # Сортируем по final_score (если есть), иначе по hook_score
+            weak_pool = sorted(
+                [r for r in rejected_hooks
+                 if r.get("reject_reason") in ("low_final_score", "low_hook_score")],
+                key=lambda r: float(r.get("final_score", r.get("hook_score", 0.0))),
+                reverse=True,
+            )[:3]
+            for idx, wk in enumerate(weak_pool):
+                ws = float(wk.get("start", 0.0))
+                we = float(wk.get("end", ws + cfg.min_hook_duration))
+                weak_moment = {
+                    "start": round(ws, 2),
+                    "end": round(we, 2),
+                    "duration": round(max(0.0, we - ws), 2),
+                    "score": float(wk.get("final_score", wk.get("hook_score", 0.0))),
+                    "hook_score": float(wk.get("hook_score", 0.0)),
+                    "hook_type": "weak_hook",
+                    "hook_confidence": 0.20,
+                    "reasons": [{
+                        "code": "weak_hook_manual_review",
+                        "message": f"Candidate below threshold but had raw signal "
+                                   f"(reject_reason={wk.get('reject_reason')})",
+                        "weight": 0.4,
+                    }],
+                    "export_decision": "manual_review",
+                    "reject_reason_original": wk.get("reject_reason"),
+                    "transcript_preview": wk.get("transcript_preview", ""),
+                    "proposal_source": wk.get("proposal_source", "unknown"),
+                    "weak_rank": idx + 1,
+                    "is_weak_fallback": True,
+                }
+                hook_candidates.append(weak_moment)
+            weak_hook_fallback_used = True
+            logger.info(
+                f"weak_hook_manual_review fallback: promoted top-{len(weak_pool)} "
+                f"rejected hooks to manual_review (from {len(rejected_hooks)} rejected)"
+            )
+
         if not hook_candidates:
-            logger.info("No hooks detected after filtering")
-            return _empty_hook_result(video_duration_sec, "no_hook_detected", cfg)
+            logger.info("No hooks detected after filtering (rejected=%d)", len(rejected_hooks))
+            empty = _empty_hook_result(video_duration_sec, "no_hook_detected", cfg)
+            empty["rejected_hooks"] = rejected_hooks
+            empty["hook_filter_reasons"] = hook_filter_reasons
+            empty["hook_proposals_count"] = len(proposals) if proposals else 0
+            empty["micro_hook_active"] = micro_hook_active
+            empty["stats"]["n_raw_proposals"] = len(proposals) if proposals else 0
+            empty["stats"]["n_rejected"] = len(rejected_hooks)
+            empty["stats"]["filter_reasons"] = hook_filter_reasons
+            empty["stats"]["micro_hook_active"] = micro_hook_active
+            return empty
 
         # ── Proposal audit: was the best hook proposed? (Stage 1) ─────────────
         # The most common proposer failure: the best hook moment was never
@@ -4122,6 +4235,12 @@ def find_hook_moments(
         return {
             "mode": "hook",
             "hook_moments": hook_candidates,
+            # v2.1: diagnostics
+            "rejected_hooks": rejected_hooks,
+            "hook_filter_reasons": hook_filter_reasons,
+            "hook_proposals_count": len(proposals) if proposals else 0,
+            "micro_hook_active": micro_hook_active,
+            "weak_hook_fallback_used": weak_hook_fallback_used,
             "stats": {
                 "total_duration":           video_duration_sec,
                 "profile_name":             f"{cfg.mode_name} {cfg.profile_version}",
@@ -4133,6 +4252,11 @@ def find_hook_moments(
                 "min_hook_score_original":  cfg.min_hook_score,
                 "min_hook_score_effective": eff_min_hook_score,
                 "loose_hook_mode":          cfg.loose_hook_mode,
+                "micro_hook_active":        micro_hook_active,
+                "n_raw_proposals":          len(proposals) if proposals else 0,
+                "n_rejected":               len(rejected_hooks),
+                "filter_reasons":           hook_filter_reasons,
+                "weak_hook_fallback_used":  weak_hook_fallback_used,
                 "avg_score":                round(avg_score, 3),
                 "avg_confidence":           round(avg_confidence, 3),
                 "max_hook_score":           round(max(m["hook_score"] for m in hook_candidates), 3),

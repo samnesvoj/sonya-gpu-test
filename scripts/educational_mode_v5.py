@@ -475,7 +475,56 @@ def extract_visual_features_for_window(
     if global_stats:
         return _build_visual_features_from_dict(global_stats)
 
-    # ── path 5: conservative defaults ──────────────────────────────────────
+    # ── path 5 (v5.1): benchmark-style YOLO detections ────────────────────
+    # Detections formatted as [{"timestamp_sec", "person_count",
+    # "objects", "confidence_max"}, ...]
+    detections = base_analysis.get("detections", [])
+    if detections and isinstance(detections, list) and detections:
+        first = detections[0] if isinstance(detections[0], dict) else {}
+        if "timestamp_sec" in first or "person_count" in first:
+            in_window = [
+                d for d in detections
+                if start_sec <= float(d.get("timestamp_sec", d.get("timestamp", -1))) <= end_sec
+            ]
+            if not in_window:
+                mid = (start_sec + end_sec) / 2.0
+                in_window = [min(
+                    detections,
+                    key=lambda d: abs(float(d.get("timestamp_sec", d.get("timestamp", 0))) - mid),
+                )]
+            person_ratio = float(np.mean([1.0 if d.get("person_count", 0) > 0 else 0.0 for d in in_window]))
+            multi_person_ratio = float(np.mean([1.0 if d.get("person_count", 0) > 1 else 0.0 for d in in_window]))
+            obj_density = float(np.mean([len(d.get("objects", []) or []) for d in in_window]) / 5.0)
+            obj_density = float(np.clip(obj_density, 0.0, 1.0))
+            conf_mean = float(np.mean([d.get("confidence_max", 0.0) for d in in_window]))
+            if len(in_window) >= 2:
+                confs = [d.get("confidence_max", 0.0) for d in in_window]
+                scene_change_rate = float(np.clip(np.mean(np.abs(np.diff(confs))) * 2.0, 0.0, 1.0))
+            else:
+                scene_change_rate = 0.05
+
+            derived = {
+                "person_present_ratio": person_ratio,
+                "single_speaker_ratio": max(0.0, person_ratio - multi_person_ratio),
+                "multi_person_ratio": multi_person_ratio,
+                "screen_presence_ratio": obj_density * 0.5,
+                "whiteboard_presence_ratio": 0.1,
+                "desk_demo_presence_ratio": obj_density * 0.3,
+                "object_demo_ratio": obj_density,
+                "hand_activity_mean": 0.2,
+                "text_region_ratio_mean": 0.2,
+                "dense_text_likelihood_mean": 0.3,
+                "scene_stability": max(0.0, 1.0 - scene_change_rate),
+                "scene_change_rate": scene_change_rate,
+                "camera_motion_mean": min(scene_change_rate * 0.8, 0.5),
+                "visual_clutter_score": min(obj_density * 0.8, 0.7),
+                "blur_ratio": 0.1,
+                "low_light_ratio": 0.05,
+            }
+            vf = _build_visual_features_from_dict(derived)
+            return vf
+
+    # ── path 6: conservative defaults ──────────────────────────────────────
     return _visual_defaults()
 
 
@@ -1492,6 +1541,140 @@ def refine_clip_boundaries(
 
 
 # =============================================================================
+# v5.1 — ASR-BASED TOPIC SEGMENTATION (non-LLM, lightweight)
+# =============================================================================
+
+# Structural markers that likely indicate a topic transition
+_TOPIC_SPLIT_MARKERS = [
+    # Russian
+    "важно", "важный момент", "запомни",
+    "например", "к примеру", "вот пример",
+    "то есть", "иначе говоря", "другими словами",
+    "во-первых", "во-вторых", "в-третьих",
+    "первое", "второе", "третье",
+    "поэтому", "таким образом", "итог",
+    "вывод", "подводя итог", "резюмируя",
+    "перейдём", "а теперь", "теперь про",
+    "следующий момент", "кстати",
+    # English
+    "important", "for example", "for instance",
+    "that is", "in other words", "firstly",
+    "secondly", "thirdly", "first", "second", "third",
+    "therefore", "in conclusion", "to summarize",
+    "let's move on", "now let's", "next",
+]
+
+
+def segment_topics_from_asr(
+    asr_segments: List[Dict],
+    video_duration_sec: float,
+    pause_threshold_sec: float = 2.5,
+    min_segs_per_topic: int = 3,
+    max_segs_per_topic: int = 6,
+    min_topic_duration_sec: float = 6.0,
+) -> List[Dict]:
+    """
+    Non-LLM topic segmentation из ASR сегментов.
+
+    Алгоритм:
+      1. Детектим "split points" по паузам (gap > pause_threshold_sec)
+         и маркерам-сигналам ("важно", "например", "первое", …).
+      2. Группируем сегменты между точками разреза.
+      3. Enforce: 3-6 ASR segments per topic — сливаем короткие, дробим длинные.
+
+    Returns:
+      [{"start", "end", "duration", "title", "topic_id", "keywords",
+        "n_asr_segments", "_source": "asr_topic_segmentation"}]
+    """
+    if not asr_segments or len(asr_segments) < min_segs_per_topic:
+        return []
+
+    segs = sorted(asr_segments, key=lambda s: float(s.get("start", 0.0)))
+
+    # 1. Find split points (indices at which a new topic starts)
+    split_indices = [0]
+    for i in range(1, len(segs)):
+        prev_end = float(segs[i - 1].get("end", 0.0))
+        cur_start = float(segs[i].get("start", 0.0))
+        cur_text = str(segs[i].get("text", "")).lower()
+
+        pause_split = (cur_start - prev_end) > pause_threshold_sec
+        marker_split = any(m in cur_text for m in _TOPIC_SPLIT_MARKERS)
+
+        if pause_split or marker_split:
+            split_indices.append(i)
+
+    # Build initial groups
+    groups: List[List[int]] = []
+    for k in range(len(split_indices)):
+        start_i = split_indices[k]
+        end_i = split_indices[k + 1] if k + 1 < len(split_indices) else len(segs)
+        group = list(range(start_i, end_i))
+        if group:
+            groups.append(group)
+
+    # 2. Normalise group size: merge small, split large
+    merged: List[List[int]] = []
+    i = 0
+    while i < len(groups):
+        g = groups[i]
+        # If too small — merge with next
+        while len(g) < min_segs_per_topic and i + 1 < len(groups):
+            g = g + groups[i + 1]
+            i += 1
+        merged.append(g)
+        i += 1
+
+    final_groups: List[List[int]] = []
+    for g in merged:
+        if len(g) <= max_segs_per_topic:
+            final_groups.append(g)
+        else:
+            # Split into chunks of ≤ max_segs_per_topic
+            step = max_segs_per_topic
+            for s in range(0, len(g), step):
+                chunk = g[s:s + step]
+                if chunk:
+                    final_groups.append(chunk)
+
+    # 3. Build topic dicts
+    topics: List[Dict] = []
+    for topic_id, indices in enumerate(final_groups):
+        g_start = float(segs[indices[0]].get("start", 0.0))
+        g_end = float(segs[indices[-1]].get("end", g_start + 5.0))
+        g_end = min(g_end, video_duration_sec)
+        duration = g_end - g_start
+
+        if duration < min_topic_duration_sec:
+            continue
+
+        # Keywords: TOP-5 common non-trivial words
+        joined_text = " ".join(str(segs[i].get("text", "")) for i in indices).lower()
+        tokens = [t for t in joined_text.split() if len(t) > 4]
+        from collections import Counter as _C
+        top_tokens = [tok for tok, _ in _C(tokens).most_common(5)]
+
+        # Title: first 8 words of the first segment
+        first_text = str(segs[indices[0]].get("text", "")).strip()
+        title = " ".join(first_text.split()[:8]) or f"Topic {topic_id + 1}"
+
+        topics.append({
+            "start": round(g_start, 2),
+            "end": round(g_end, 2),
+            "duration": round(duration, 2),
+            "title": title,
+            "topic_id": topic_id,
+            "keywords": top_tokens,
+            "n_asr_segments": len(indices),
+            "asr_indices": indices,
+            "confidence": 0.5,  # неизвестно — для совместимости с viral topic API
+            "_source": "asr_topic_segmentation",
+        })
+
+    return topics
+
+
+# =============================================================================
 # LAYER 9 — ORCHESTRATOR
 # =============================================================================
 
@@ -1534,24 +1717,44 @@ def run_educational_mode_v5(
         return {"mode": mode, "error": "audio_extraction_failed", "detail": audio_global.error}
 
     # ── Step 2: topic segments ─────────────────────────────────────────────
+    # v5.1: если нет явных topic_segments, но есть >10 ASR сегментов —
+    # автоматически сегментируем по паузам + маркерам (non-LLM).
+    topic_source = "provided"
     if not topic_segments:
-        if config["requires_topic_segmentation"]:
-            logger.warning(
-                "Educational mode requires topic segmentation — degrading to educational-lite (single topic). "
-                "Provide real topic_segments for full intelligent selection."
+        if asr_segments and len(asr_segments) > 10:
+            auto_topics = segment_topics_from_asr(
+                asr_segments=asr_segments,
+                video_duration_sec=audio_global.duration_sec,
             )
-            topic_segments = [{
-                "start": 0.0,
-                "end": audio_global.duration_sec,
-                "duration": audio_global.duration_sec,
-                "title": "Full Video",
-                "topic_id": 0,
-                "keywords": [],
-                "_fallback": True,
-            }]
-        else:
-            topic_segments = []
-    logger.info(f"Step 2/8: {len(topic_segments)} topics")
+            if auto_topics:
+                topic_segments = auto_topics
+                topic_source = "asr_auto"
+                logger.info(
+                    f"Auto-segmented {len(asr_segments)} ASR segments into "
+                    f"{len(auto_topics)} topics using pauses + markers"
+                )
+
+        if not topic_segments:
+            if config["requires_topic_segmentation"]:
+                logger.warning(
+                    "Educational mode requires topic segmentation — "
+                    "degrading to educational-lite (single topic). "
+                    "Provide real topic_segments for full intelligent selection."
+                )
+                topic_segments = [{
+                    "start": 0.0,
+                    "end": audio_global.duration_sec,
+                    "duration": audio_global.duration_sec,
+                    "title": "Full Video",
+                    "topic_id": 0,
+                    "keywords": [],
+                    "_fallback": True,
+                }]
+                topic_source = "fallback_single_topic"
+            else:
+                topic_segments = []
+                topic_source = "none"
+    logger.info(f"Step 2/8: {len(topic_segments)} topics (source={topic_source})")
 
     # ── Step 3: build windows ──────────────────────────────────────────────
     logger.info("Step 3/8: Building windows...")
@@ -1608,7 +1811,49 @@ def run_educational_mode_v5(
     selected = refine_clip_boundaries(selected, asr_segments, audio_global)
 
     # ── Build output ───────────────────────────────────────────────────────
-    return build_educational_output(selected, topic_segments, analyzed, config, threshold)
+    out = build_educational_output(selected, topic_segments, analyzed, config, threshold)
+    out["topic_source"] = topic_source
+    # v5.1: экспонируем topic_segments как отдельное поле для benchmark дампа
+    out["topic_segments"] = [
+        {k: v for k, v in t.items() if k != "asr_indices"}
+        for t in topic_segments
+    ]
+    # v5.1: educational_windows.json содержит ВСЕ построенные окна (до фильтра)
+    out["educational_windows"] = [
+        {
+            "start": round(a["context"].start, 2),
+            "end": round(a["context"].end, 2),
+            "duration": round(a["context"].end - a["context"].start, 2),
+            "topic_id": a["context"].topic_id,
+            "topic_title": a["context"].topic_title,
+            "segment_type": a["semantic"].segment_type,
+            "transcript_preview": a["context"].transcript[:120],
+            "has_takeaway": a["semantic"].has_takeaway,
+            "has_formula": a["semantic"].has_formula,
+            "has_example": a["semantic"].has_example,
+            "has_steps": a["semantic"].has_steps,
+            "final_score": round(a["score"].final_score, 4),
+            "eligible": a["score"].eligible,
+            "reject_reason": a["score"].reject_reason,
+        }
+        for a in analyzed
+    ]
+    # v5.1: educational_scores.json — только числовые скоры, компактно
+    out["educational_scores"] = [
+        {
+            "start": round(a["context"].start, 2),
+            "end": round(a["context"].end, 2),
+            "topic_id": a["context"].topic_id,
+            "final": round(a["score"].final_score, 4),
+            "semantic": round(a["score"].semantic_core, 4),
+            "audio": round(a["score"].audio_core, 4),
+            "visual": round(a["score"].visual_core, 4),
+            "pedagogy": round(a["score"].pedagogy_core, 4),
+            "eligible": a["score"].eligible,
+        }
+        for a in analyzed
+    ]
+    return out
 
 
 # =============================================================================

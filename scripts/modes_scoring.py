@@ -344,7 +344,10 @@ def find_viral_moments_v3(
                         "semantic_score": round(semantic_subscore, 3),
                         "topic_id": topic_idx,
                         "topic_confidence": round(topic.get("confidence", 0.5), 3),
-                        **{k: round(v, 3) for k, v in features.items()}
+                        "viral_feature_breakdown": features.get("viral_feature_breakdown", {}),
+                        **{k: (round(v, 3) if isinstance(v, (int, float)) else v)
+                           for k, v in features.items()
+                           if not k.startswith("_") and k != "viral_feature_breakdown"}
                     })
             
             # Гарантируем минимум моментов на тему
@@ -373,7 +376,10 @@ def find_viral_moments_v3(
                         "semantic_score": round(compute_semantic_score(features), 3),
                         "topic_id": topic_idx,
                         "forced": True,  # Помечаем что это forced выбор
-                        **{k: round(v, 3) for k, v in features.items()}
+                        "viral_feature_breakdown": features.get("viral_feature_breakdown", {}),
+                        **{k: (round(v, 3) if isinstance(v, (int, float)) else v)
+                           for k, v in features.items()
+                           if not k.startswith("_") and k != "viral_feature_breakdown"}
                     })
             
             viral_moments.extend(topic_moments)
@@ -411,7 +417,10 @@ def find_viral_moments_v3(
                     "audio_score": round(audio_subscore, 3),
                     "visual_score": round(visual_subscore, 3),
                     "semantic_score": round(semantic_subscore, 3),
-                    **{k: round(v, 3) for k, v in features.items()}
+                    "viral_feature_breakdown": features.get("viral_feature_breakdown", {}),
+                    **{k: (round(v, 3) if isinstance(v, (int, float)) else v)
+                       for k, v in features.items()
+                       if not k.startswith("_") and k != "viral_feature_breakdown"}
                 })
     
     # Сортируем по скору и берём топ-K
@@ -776,8 +785,10 @@ def find_viral_moments_v2(
                 "start": w["start"],
                 "end": w["end"],
                 "virality_score": round(score, 4),
-                # Добавляем все фичи для отладки
-                **{k: round(v, 3) for k, v in features.items()}
+                "viral_feature_breakdown": features.get("viral_feature_breakdown", {}),
+                **{k: (round(v, 3) if isinstance(v, (int, float)) else v)
+                   for k, v in features.items()
+                   if not k.startswith("_") and k != "viral_feature_breakdown"}
             })
     
     # Сортируем по скору и берём топ-K
@@ -940,6 +951,196 @@ def create_sliding_windows(
     return windows
 
 
+# v3.1: LEXICAL FALLBACK — used when LLM unavailable or API key missing
+_VIRAL_LEXICAL_MARKERS = {
+    "strong_claims": [
+        "все", "никто", "никогда", "всегда", "главное", "ключевое",
+        "нужно только", "работает всегда", "гарантирую", "100%",
+        "every", "never", "always", "only thing", "the key",
+    ],
+    "emotion_words": [
+        "шок", "шокирован", "удивительно", "невероятно", "потрясающе",
+        "обалдеть", "вау", "восторг", "ужас", "страх", "ненависть",
+        "любовь", "боль", "ярость", "радость",
+        "shocking", "amazing", "incredible", "insane", "crazy", "wild",
+    ],
+    "contrast_markers": [
+        "но", "однако", "хотя", "зато", "наоборот", "противоположность",
+        "в отличие", "с другой стороны", "тем не менее",
+        "but", "however", "instead", "on the contrary", "yet",
+    ],
+    "novelty_markers": [
+        "впервые", "новое", "новейшее", "секрет", "скрывают", "раскрываю",
+        "никто не знает", "мало кто знает", "малоизвестный",
+        "first time", "secret", "hidden", "nobody knows", "unknown",
+    ],
+    "first_person_conflict": [
+        "я столкнулся", "моя проблема", "когда я", "я понял", "у меня была",
+        "мне пришлось", "я не знал", "я думал", "я боялся", "я ошибся",
+        "i faced", "my problem", "when i", "i realized", "i thought",
+    ],
+}
+
+
+def _count_lexical_markers(text_lower: str, markers: List[str]) -> int:
+    return sum(1 for m in markers if m in text_lower)
+
+
+def analyze_viral_semantics_lexical(text: str) -> Dict[str, float]:
+    """
+    Лексикалный анализ текста БЕЗ LLM для VIRAL режима.
+    Выдаёт те же 3 скора, что и LLM-версия, но на основе маркеров.
+
+    Шкала:
+      hook_strength   — questions + novelty + first-person conflict
+      tension_level   — contrast markers + emotion words + first-person conflict
+      payoff_presence — strong_claims + exclamations + (conclusion markers)
+    """
+    if not text or len(text.strip()) < 10:
+        return {"hook_strength": 0.3, "tension_level": 0.3, "payoff_presence": 0.3}
+
+    text_lower = text.lower()
+    n_questions = text.count("?")
+    n_excl = text.count("!")
+
+    strong_claims = _count_lexical_markers(text_lower, _VIRAL_LEXICAL_MARKERS["strong_claims"])
+    emotion = _count_lexical_markers(text_lower, _VIRAL_LEXICAL_MARKERS["emotion_words"])
+    contrast = _count_lexical_markers(text_lower, _VIRAL_LEXICAL_MARKERS["contrast_markers"])
+    novelty = _count_lexical_markers(text_lower, _VIRAL_LEXICAL_MARKERS["novelty_markers"])
+    fp_conflict = _count_lexical_markers(text_lower, _VIRAL_LEXICAL_MARKERS["first_person_conflict"])
+
+    # Hook strength: есть ли вопрос, обещание новизны, первое лицо
+    hook_raw = (
+        0.30 * min(n_questions / 2.0, 1.0)
+        + 0.35 * min(novelty / 2.0, 1.0)
+        + 0.20 * min(fp_conflict / 2.0, 1.0)
+        + 0.15 * min(emotion / 3.0, 1.0)
+    )
+
+    # Tension: контраст, эмоции, первое лицо с конфликтом
+    tension_raw = (
+        0.40 * min(contrast / 2.0, 1.0)
+        + 0.30 * min(emotion / 3.0, 1.0)
+        + 0.30 * min(fp_conflict / 2.0, 1.0)
+    )
+
+    # Payoff: claims + exclamations + conclusion markers
+    payoff_raw = (
+        0.50 * min(strong_claims / 2.0, 1.0)
+        + 0.30 * min(n_excl / 2.0, 1.0)
+        + 0.20 * min(emotion / 4.0, 1.0)
+    )
+
+    return {
+        "hook_strength": float(min(max(hook_raw, 0.15), 0.95)),
+        "tension_level": float(min(max(tension_raw, 0.15), 0.95)),
+        "payoff_presence": float(min(max(payoff_raw, 0.15), 0.95)),
+        # raw counts for debugging
+        "_lex_strong_claims": strong_claims,
+        "_lex_emotion": emotion,
+        "_lex_contrast": contrast,
+        "_lex_novelty": novelty,
+        "_lex_fp_conflict": fp_conflict,
+        "_lex_questions": n_questions,
+        "_lex_exclamations": n_excl,
+    }
+
+
+def get_visual_features_for_window_from_yolo(
+    base_analysis: Dict,
+    start_sec: float,
+    end_sec: float,
+) -> Dict[str, float]:
+    """
+    Window-level visual features, вычисленные из YOLO detections.
+    Формат detections (benchmark): [{"timestamp_sec", "person_count",
+    "objects", "confidence_max"}].
+
+    Возвращает стандартные 4 viral-фичи + расширенные метрики
+    (person_presence_ratio, object_density, confidence_peaks,
+     scene_changes, motion_proxy).
+    """
+    detections = base_analysis.get("detections", []) or []
+    if not detections:
+        return {
+            "action_intensity": base_analysis.get("action_intensity", 0.5),
+            "visual_salience": base_analysis.get("visual_salience", 0.5),
+            "composition_score": base_analysis.get("composition_score", 0.5),
+            "emotional_peaks": base_analysis.get("emotional_peaks", 0.5),
+            "person_presence_ratio": base_analysis.get("person_presence_ratio", 0.0),
+            "object_density": 0.0,
+            "confidence_peaks": 0.0,
+            "scene_changes": 0.0,
+            "motion_proxy": 0.0,
+            "_source": "global_fallback",
+        }
+
+    # Совместимость: поддерживаем и "timestamp_sec" (benchmark), и "timestamp" (grok4_teacher)
+    def _ts(d: Dict) -> float:
+        return float(d.get("timestamp_sec", d.get("timestamp", 0.0)))
+
+    in_window = [d for d in detections if start_sec <= _ts(d) <= end_sec]
+    if not in_window:
+        # Берём ближайший кадр
+        mid = (start_sec + end_sec) / 2.0
+        in_window = [min(detections, key=lambda d: abs(_ts(d) - mid))]
+
+    person_counts = [int(d.get("person_count", 0)) for d in in_window]
+    confidences = [float(d.get("confidence_max", 0.0)) for d in in_window]
+    obj_counts = [len(d.get("objects", []) or []) for d in in_window]
+
+    np_arr_conf = np.asarray(confidences) if confidences else np.asarray([0.0])
+    np_arr_persons = np.asarray(person_counts) if person_counts else np.asarray([0.0])
+    np_arr_objs = np.asarray(obj_counts) if obj_counts else np.asarray([0.0])
+
+    person_presence_ratio = float(np.mean((np_arr_persons > 0).astype(float)))
+    object_density = float(np.clip(np.mean(np_arr_objs) / 5.0, 0.0, 1.0))
+    mean_conf = float(np.mean(np_arr_conf))
+    confidence_peaks = float(np.clip((np.max(np_arr_conf) - mean_conf), 0.0, 1.0))
+
+    # Motion proxy: frame-to-frame изменения в person_count + confidence
+    if len(np_arr_conf) >= 2:
+        conf_diff = float(np.mean(np.abs(np.diff(np_arr_conf))))
+        person_diff = float(np.mean(np.abs(np.diff(np_arr_persons.astype(float)))))
+        motion_proxy = float(np.clip(conf_diff * 2.5 + person_diff * 0.5, 0.0, 1.0))
+    else:
+        motion_proxy = 0.0
+
+    # Scene changes: скачки в object set между кадрами
+    if len(in_window) >= 2:
+        scene_change_events = 0
+        prev_objs = {o.get("class") for o in in_window[0].get("objects", [])}
+        for d in in_window[1:]:
+            cur_objs = {o.get("class") for o in d.get("objects", [])}
+            overlap = len(prev_objs & cur_objs) / max(len(prev_objs | cur_objs), 1)
+            if overlap < 0.4:
+                scene_change_events += 1
+            prev_objs = cur_objs
+        scene_changes = float(np.clip(scene_change_events / max(len(in_window) - 1, 1), 0.0, 1.0))
+    else:
+        scene_changes = 0.0
+
+    # Главные 4 фичи, совместимые с формулой virality_score:
+    action_intensity = float(np.clip(motion_proxy * 0.6 + object_density * 0.4, 0.0, 1.0))
+    visual_salience = float(np.clip(mean_conf * 0.5 + confidence_peaks * 0.5, 0.0, 1.0))
+    composition_score = float(np.clip(person_presence_ratio * 0.7 + (1 - scene_changes) * 0.3, 0.0, 1.0))
+    emotional_peaks = float(np.clip(confidence_peaks * 0.4 + motion_proxy * 0.3 + person_presence_ratio * 0.3, 0.0, 1.0))
+
+    return {
+        "action_intensity": action_intensity,
+        "visual_salience": visual_salience,
+        "composition_score": composition_score,
+        "emotional_peaks": emotional_peaks,
+        "person_presence_ratio": person_presence_ratio,
+        "object_density": object_density,
+        "confidence_peaks": confidence_peaks,
+        "scene_changes": scene_changes,
+        "motion_proxy": motion_proxy,
+        "_source": "yolo_window",
+        "_n_frames": len(in_window),
+    }
+
+
 def analyze_viral_semantics(text: str) -> Dict[str, float]:
     """
     LLM анализ текста для VIRAL режима.
@@ -952,20 +1153,12 @@ def analyze_viral_semantics(text: str) -> Dict[str, float]:
     Returns:
         Dict с 3 скорами (0-1)
     """
-    # Fallback если LLM недоступен
+    # v3.1: если LLM недоступен — используем lexical fallback (а не тупое 0.5)
     if not HAS_LLM or not _call_llm:
-        return {
-            "hook_strength": 0.5,
-            "tension_level": 0.5,
-            "payoff_presence": 0.5
-        }
+        return analyze_viral_semantics_lexical(text)
     
     if not text or len(text.strip()) < 10:
-        return {
-            "hook_strength": 0.5,
-            "tension_level": 0.5,
-            "payoff_presence": 0.5
-        }
+        return analyze_viral_semantics_lexical(text)
     
     prompt = f'''Analyze this video segment for virality. Reply with ONLY a JSON object.
 
@@ -990,11 +1183,8 @@ Rate low (0.0-0.3) if: boring, no hook, calm, no conflict, no conclusion.'''
         data = _parse_json_from_response(raw) if raw else None
         
         if not data:
-            return {
-                "hook_strength": 0.5,
-                "tension_level": 0.5,
-                "payoff_presence": 0.5
-            }
+            # v3.1: вместо тупого 0.5 — lexical fallback
+            return analyze_viral_semantics_lexical(text)
         
         return {
             "hook_strength": float(data.get("hook_strength", 0.5)),
@@ -1002,12 +1192,7 @@ Rate low (0.0-0.3) if: boring, no hook, calm, no conflict, no conclusion.'''
             "payoff_presence": float(data.get("payoff_presence", 0.5))
         }
     except Exception as e:
-        # print(f"  WARNING: LLM analysis failed: {e}")
-        return {
-            "hook_strength": 0.5,
-            "tension_level": 0.5,
-            "payoff_presence": 0.5
-        }
+        return analyze_viral_semantics_lexical(text)
 
 
 def compute_viral_features_for_window(
@@ -1025,27 +1210,41 @@ def compute_viral_features_for_window(
         АУДИО (4): audio_energy, speech_rate, silence_ratio, pitch_variance
         СЕМАНТИКА (3): hook_strength, tension_level, payoff_presence
     """
-    # 1. Визуальные фичи (PRODUCTION v3.0: time-series стандарт)
-    if HAS_TIMESERIES_VISUAL and get_visual_features_for_window:
-        # ✅ PRODUCTION STANDARD: Window-based visual features
+    # 1. Визуальные фичи — приоритет:
+    #    (a) YOLO detections из benchmark → window-aware
+    #    (b) grok4_teacher frames_data → window-aware
+    #    (c) global fallback (deprecated)
+    detections = base_analysis.get("detections") or []
+    has_yolo_timeseries = (
+        detections
+        and any("timestamp_sec" in d or "timestamp" in d for d in detections)
+    )
+
+    if has_yolo_timeseries:
+        visual_features = get_visual_features_for_window_from_yolo(
+            base_analysis, start_sec, end_sec,
+        )
+    elif HAS_TIMESERIES_VISUAL and get_visual_features_for_window:
         visual_features = get_visual_features_for_window(base_analysis, start_sec, end_sec)
+        visual_features["_source"] = "frames_data_window"
     else:
-        # ⚠️ DEPRECATED FALLBACK: Global features (backward compatibility only)
         visual_features = {
             "action_intensity": base_analysis.get("action_intensity", 0.5),
             "visual_salience": base_analysis.get("visual_salience", 0.5),
             "composition_score": base_analysis.get("composition_score", 0.5),
             "emotional_peaks": base_analysis.get("emotional_peaks", 0.5),
+            "_source": "global_fallback_deprecated",
         }
     
     # 2. Аудио фичи (реальные для окна)
     audio_features = compute_audio_features(video_path, start_sec, end_sec, asr_segments)
     
-    # 3. Семантические фичи (LLM, если есть транскрипт)
+    # 3. Семантические фичи — LLM если доступен, иначе lexical fallback
     semantic_features = {
-        "hook_strength": 0.5,
-        "tension_level": 0.5,
-        "payoff_presence": 0.5
+        "hook_strength": 0.3,
+        "tension_level": 0.3,
+        "payoff_presence": 0.3,
+        "_source": "no_text",
     }
     
     if asr_segments:
@@ -1059,14 +1258,33 @@ def compute_viral_features_for_window(
         window_text = " ".join(window_text_parts).strip()
         
         if window_text and len(window_text) > 20:
+            # v3.1: LLM + lexical fallback inside analyze_viral_semantics
             semantic_features = analyze_viral_semantics(window_text)
+            # Помечаем источник
+            if "_source" not in semantic_features:
+                semantic_features["_source"] = "llm" if HAS_LLM else "lexical"
+        else:
+            # Короткий текст — тоже lexical (поставит минимальные значения)
+            semantic_features = analyze_viral_semantics_lexical(window_text or "")
+            semantic_features["_source"] = "lexical_short_text"
     
-    # Объединяем все фичи
-    return {
+    # v3.1: объединяем все фичи + возвращаем структурированный feature breakdown
+    merged = {
         **visual_features,
         **audio_features,
-        **semantic_features
+        **semantic_features,
     }
+    # Прячем служебные "_source" в отдельный ключ, но оставляем для debug
+    merged["viral_feature_breakdown"] = {
+        "visual": {k: v for k, v in visual_features.items() if not k.startswith("_")},
+        "audio":  {k: v for k, v in audio_features.items() if not k.startswith("_")},
+        "semantic": {k: v for k, v in semantic_features.items() if not k.startswith("_")},
+        "sources": {
+            "visual": visual_features.get("_source", "unknown"),
+            "semantic": semantic_features.get("_source", "unknown"),
+        },
+    }
+    return merged
 
 
 def _get_video_duration_sec(video_path: str) -> float:

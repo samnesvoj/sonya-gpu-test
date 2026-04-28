@@ -3190,6 +3190,208 @@ def run_ui_payload_builder(assignments, theme_blocks, edges, all_candidates, cfg
 
 
 # =============================================================================
+# v3.2 — ADAPTIVE DURATION + SECOND-PASS NMS + DEGRADED PREVIEW
+# =============================================================================
+
+def _resolve_effective_target(
+    cfg: TrailerModeConfig,
+    video_dur: float,
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Адаптивный target_duration:
+      max_total_duration = min(target_trailer_duration, video_duration * 0.45)
+
+    Для коротких роликов (< 3 мин) понижаем дефолтные 90с до 30-45с:
+      - video < 60s: 25% от длительности (но не менее 10с, не более 20с)
+      - 60 ≤ video < 180s: 30-45с
+      - 180 ≤ video < 600s: target как есть, но не более 45% длительности
+      - video ≥ 600s: target как есть
+
+    Возвращает (effective_target, trace).
+    """
+    original = cfg.target_trailer_duration
+    hard_cap = video_dur * 0.45
+
+    if video_dur < 60.0:
+        target = max(10.0, min(20.0, video_dur * 0.25))
+        reason = "short_video_auto_preview"
+    elif video_dur < 180.0:
+        target = min(max(30.0, original * 0.50), 45.0)
+        reason = "medium_video_preview_30_45s"
+    elif video_dur < 600.0:
+        target = min(original, hard_cap)
+        reason = "cap_at_45pct_of_video"
+    else:
+        target = original
+        reason = "long_video_use_original"
+
+    # Абсолютный потолок — не больше 45% длительности видео
+    target = min(target, hard_cap)
+    target = max(target, 5.0)  # sanity floor
+
+    trace = {
+        "original_target": original,
+        "video_duration_sec": video_dur,
+        "max_hard_cap_45pct": hard_cap,
+        "effective_target": round(target, 2),
+        "reason": reason,
+    }
+    return float(target), trace
+
+
+def _second_pass_nms_and_dedupe(
+    final_candidates: List["TrailerCandidate"],
+    assignments: List["SlotAssignment"],
+    overlap_iou_thresh: float = 0.35,
+) -> Tuple[List["TrailerCandidate"], Dict[str, Any]]:
+    """
+    Второй pass NMS после slot assignment:
+      1. Если два кандидата пересекаются IoU > overlap_iou_thresh —
+         оставляем более короткий И с большим trailer_score_final.
+      2. Один и тот же candidate_id не может быть в нескольких slots одновременно.
+      3. Возвращает (kept_candidates, trace_dict) для debug.
+    """
+    trace: Dict[str, Any] = {
+        "overlap_iou_thresh": overlap_iou_thresh,
+        "input_count": len(final_candidates),
+        "duplicate_removed": [],      # дубли по candidate_id
+        "overlap_removed": [],        # убраны по IoU
+    }
+
+    # 1. Убираем дубли по candidate_id (не может быть в нескольких slots)
+    seen_ids: set = set()
+    dedup: List["TrailerCandidate"] = []
+    for c in final_candidates:
+        cid = getattr(c, "candidate_id", None)
+        if cid in seen_ids:
+            trace["duplicate_removed"].append({
+                "candidate_id": cid, "start": c.start, "end": c.end,
+                "reason": "already_assigned_to_another_slot",
+            })
+            continue
+        seen_ids.add(cid)
+        dedup.append(c)
+
+    # 2. Second-pass NMS — сортируем по score desc, затем убираем overlap
+    sorted_by_score = sorted(dedup, key=lambda x: getattr(x, "trailer_score_final", 0.0), reverse=True)
+    kept: List["TrailerCandidate"] = []
+    for c in sorted_by_score:
+        overlap_with = None
+        for k in kept:
+            if _iou((c.start, c.end), (k.start, k.end)) > overlap_iou_thresh:
+                overlap_with = k
+                break
+        if overlap_with is None:
+            kept.append(c)
+        else:
+            # Правило: если `c` короче И имеет >= score — заменяем. Иначе убираем `c`.
+            c_score = getattr(c, "trailer_score_final", 0.0)
+            k_score = getattr(overlap_with, "trailer_score_final", 0.0)
+            c_dur = c.end - c.start
+            k_dur = overlap_with.end - overlap_with.start
+            if c_dur < k_dur and c_score >= k_score * 0.95:
+                kept.remove(overlap_with)
+                kept.append(c)
+                trace["overlap_removed"].append({
+                    "candidate_id": getattr(overlap_with, "candidate_id", None),
+                    "start": overlap_with.start, "end": overlap_with.end,
+                    "replaced_by": getattr(c, "candidate_id", None),
+                    "reason": "shorter_and_comparable_score",
+                })
+            else:
+                trace["overlap_removed"].append({
+                    "candidate_id": getattr(c, "candidate_id", None),
+                    "start": c.start, "end": c.end,
+                    "overlap_with": getattr(overlap_with, "candidate_id", None),
+                    "reason": "iou_exceeds_threshold",
+                })
+
+    trace["output_count"] = len(kept)
+    return sorted(kept, key=lambda c: c.start), trace
+
+
+def _classify_trailer_export_decision(
+    final_clips: List[Dict],
+    total_duration: float,
+    effective_target: float,
+    num_themes: int,
+    curiosity_agg: float,
+    spoiler_agg: float,
+    boundary_ok_avg: float,
+    is_degraded_preview: bool,
+    overlap_removed_count: int,
+) -> Tuple[str, List[str]]:
+    """
+    Единая логика export_decision для trailer:
+      auto_export    — всё хорошо + есть diversity + нет overlap + duration OK
+      manual_review  — есть сигнал, но есть одна из проблем
+      reject         — нет сигнала вообще
+
+    Возвращает (decision, reasons).
+    """
+    reasons: List[str] = []
+
+    if not final_clips:
+        return "reject", ["no_final_clips"]
+
+    # degraded_preview (нет hook/story) никогда auto_export
+    if is_degraded_preview:
+        reasons.append("degraded_preview_no_hook_or_story")
+
+    # Duration guard: если общая длительность > target * 1.15 → manual_review;
+    # если > target * 1.5 → reject
+    if total_duration > effective_target * 1.5:
+        reasons.append(f"duration_exceeds_1.5x_target ({total_duration:.1f}s > {effective_target*1.5:.1f}s)")
+        return "reject", reasons
+    if total_duration > effective_target * 1.15:
+        reasons.append(f"duration_exceeds_target ({total_duration:.1f}s > {effective_target*1.15:.1f}s)")
+
+    if num_themes <= 1:
+        reasons.append(f"low_theme_diversity (themes={num_themes})")
+    if curiosity_agg <= 0.05:
+        reasons.append(f"low_curiosity_gap ({curiosity_agg:.2f})")
+    if spoiler_agg > 0.6:
+        reasons.append(f"high_spoiler_risk ({spoiler_agg:.2f})")
+    if boundary_ok_avg < 0.55:
+        reasons.append(f"weak_boundaries (avg={boundary_ok_avg:.2f})")
+    if overlap_removed_count > 2:
+        reasons.append(f"many_overlaps_had_to_be_removed ({overlap_removed_count})")
+
+    # Есть клипы, но есть проблемы → manual_review
+    if reasons:
+        return "manual_review", reasons
+
+    return "auto_export", ["all_quality_gates_passed"]
+
+
+def _build_input_candidate_library(
+    hook_result, story_result, viral_result, educational_result,
+) -> List[Dict]:
+    """Собирает все входящие кандидаты от всех режимов в один список для debug."""
+    library: List[Dict] = []
+    for src_mode, result_dict, key in [
+        ("hook",        hook_result,        "hook_moments"),
+        ("story",       story_result,       "story_moments"),
+        ("viral",       viral_result,       "viral_moments"),
+        ("educational", educational_result, "educational_moments"),
+    ]:
+        if not result_dict:
+            continue
+        moments = result_dict.get(key, []) or result_dict.get("moments", [])
+        for m in moments:
+            library.append({
+                "source_mode": src_mode,
+                "start": m.get("start") or m.get("start_sec", 0.0),
+                "end": m.get("end") or m.get("end_sec", 0.0),
+                "score": m.get("score") or m.get("virality_score") or m.get("hook_score", 0.0),
+                "type": m.get("hook_type") or m.get("story_type") or m.get("viral_type")
+                        or m.get("segment_type") or "",
+                "title": m.get("title", ""),
+            })
+    return library
+
+
+# =============================================================================
 # PUBLIC API
 # =============================================================================
 
@@ -3214,6 +3416,32 @@ def find_trailer_clips(
 
     cfg = config or TrailerModeConfig()
     video_dur = float(video_duration_sec)
+
+    # v3.2: input candidate library для debug (все кандидаты до фильтрации)
+    input_candidate_library = _build_input_candidate_library(
+        hook_result, story_result, viral_result, educational_result,
+    )
+
+    # v3.2: degraded_preview — если нет hook И story, то trailer не может
+    # нормально собрать preview. Работаем, но помечаем результат.
+    has_hook = bool(hook_result and hook_result.get("hook_moments"))
+    has_story = bool(story_result and story_result.get("story_moments"))
+    is_degraded_preview = not (has_hook or has_story)
+
+    # v3.2: адаптивный effective target_duration с учётом длительности видео
+    effective_target, duration_cap_trace = _resolve_effective_target(cfg, video_dur)
+    original_target = cfg.target_trailer_duration
+    cfg.target_trailer_duration = effective_target
+    logger.info(
+        f"Effective target_duration: {effective_target:.1f}s "
+        f"(original={original_target:.1f}s, video={video_dur:.1f}s, "
+        f"reason={duration_cap_trace['reason']})"
+    )
+    if is_degraded_preview:
+        logger.warning(
+            "degraded_preview: hook and story results are both empty — "
+            "result will be marked as needing manual review"
+        )
 
     if all(r is None for r in [hook_result, story_result, viral_result, educational_result]):
         return _empty(video_dur, "no_mode_results", cfg)
@@ -3256,6 +3484,18 @@ def find_trailer_clips(
 
     # collect final clips (slot-selected first, then secondary fill)
     slot_selected = [a.selected for a in assignments if a.selected is not None]
+    slot_assignment_before_nms = [
+        {
+            "slot": a.slot.slot_id,
+            "candidate_id": getattr(a.selected, "candidate_id", None) if a.selected else None,
+            "start": a.selected.start if a.selected else None,
+            "end": a.selected.end if a.selected else None,
+            "score": round(getattr(a.selected, "trailer_score_final", 0.0), 3) if a.selected else None,
+            "source_mode": getattr(a.selected, "source_mode", None) if a.selected else None,
+        }
+        for a in assignments
+    ]
+
     used_ids = {c.candidate_id for c in slot_selected}
     current_dur = sum(c.duration for c in slot_selected)
 
@@ -3265,6 +3505,16 @@ def find_trailer_clips(
         if any(_iou((c.start,c.end),(k.start,k.end)) > cfg.nms_iou_thresh for k in slot_selected): continue
         if cfg.min_gap_between_clips > 0 and not _min_gap_ok(c, slot_selected, cfg.min_gap_between_clips): continue
         slot_selected.append(c); used_ids.add(c.candidate_id); current_dur+=c.duration
+
+    # v3.2: SECOND-PASS NMS — строже IoU (0.35) + dedupe по candidate_id
+    slot_selected, second_pass_trace = _second_pass_nms_and_dedupe(
+        slot_selected, assignments, overlap_iou_thresh=0.35,
+    )
+    logger.info(
+        f"Second-pass NMS: {second_pass_trace['input_count']} → {second_pass_trace['output_count']} "
+        f"(dup_removed={len(second_pass_trace['duplicate_removed'])}, "
+        f"overlap_removed={len(second_pass_trace['overlap_removed'])})"
+    )
 
     final_candidates = sorted(slot_selected, key=lambda c: c.start)
 
@@ -3321,11 +3571,79 @@ def find_trailer_clips(
     render_instructions = [{"start":c["start"],"end":c["end"],"type":c["source_mode"],
                              "score":c["score"],"reasons":c["reasons"]} for c in trailer_clips]
 
+    # v3.2: slot_assignment_after_nms — что осталось в финальной раскладке
+    slot_assignment_after_nms = [
+        {
+            "candidate_id": getattr(c, "candidate_id", None),
+            "start": c.start, "end": c.end,
+            "score": round(getattr(c, "trailer_score_final", 0.0), 3),
+            "source_mode": getattr(c, "source_mode", None),
+            "assigned_slot": getattr(c, "assigned_slot", None),
+        }
+        for c in final_candidates
+    ]
+
+    # v3.2: final_sequence_validation — набор проверок финальной последовательности
+    boundary_scores = [c.get("cut_naturalness_score", 0.0) for c in trailer_clips]
+    boundary_ok_avg = float(np.mean(boundary_scores)) if boundary_scores else 0.0
+    has_overlap = any(
+        _iou((trailer_clips[i]["start"], trailer_clips[i]["end"]),
+             (trailer_clips[j]["start"], trailer_clips[j]["end"])) > 0.0
+        for i in range(len(trailer_clips))
+        for j in range(i + 1, len(trailer_clips))
+    )
+    candidate_ids_final = [c.get("candidate_id") for c in trailer_clips]
+    has_duplicates = len(candidate_ids_final) != len(set(candidate_ids_final))
+
+    final_sequence_validation = {
+        "num_clips": len(trailer_clips),
+        "total_duration_sec": total_dur,
+        "effective_target_sec": effective_target,
+        "target_fill_pct": round(total_dur / max(effective_target, 1e-6) * 100, 1),
+        "duration_exceeds_target": total_dur > effective_target * 1.15,
+        "duration_exceeds_hard_cap": total_dur > effective_target * 1.5,
+        "has_time_overlap": has_overlap,
+        "has_duplicate_candidates": has_duplicates,
+        "num_themes": len(theme_blocks),
+        "avg_boundary_quality": round(boundary_ok_avg, 3),
+        "is_degraded_preview": is_degraded_preview,
+        "sequence_valid": (
+            not has_overlap
+            and not has_duplicates
+            and total_dur <= effective_target * 1.15
+            and len(trailer_clips) > 0
+        ),
+    }
+
+    # v3.2: export_decision — единая логика по спеке F
+    export_decision, export_reasons = _classify_trailer_export_decision(
+        trailer_clips,
+        total_duration=total_dur,
+        effective_target=effective_target,
+        num_themes=len(theme_blocks),
+        curiosity_agg=curiosity_agg,
+        spoiler_agg=spoiler_agg,
+        boundary_ok_avg=boundary_ok_avg,
+        is_degraded_preview=is_degraded_preview,
+        overlap_removed_count=len(second_pass_trace["overlap_removed"]),
+    )
+
     result: Dict[str,Any] = {
         "mode": "trailer",
         "assembly_mode": cfg.assembly_mode,
         "trailer_clips": trailer_clips,
         "render_instructions": render_instructions,
+        # v3.2: debug artifacts
+        "input_candidate_library": input_candidate_library,
+        "slot_assignment_before_nms": slot_assignment_before_nms,
+        "slot_assignment_after_nms": slot_assignment_after_nms,
+        "duplicate_removed": second_pass_trace["duplicate_removed"],
+        "overlap_removed": second_pass_trace["overlap_removed"],
+        "duration_cap_trace": duration_cap_trace,
+        "final_sequence_validation": final_sequence_validation,
+        "is_degraded_preview": is_degraded_preview,
+        "export_decision": export_decision,
+        "export_decision_reasons": export_reasons,
         "theme_blocks": [
             {"theme_id":b.theme_id,"label":b.label,"constructor_label":b.constructor_label,
              "start":round(b.start,2),"end":round(b.end,2),"role":b.role,
@@ -3380,13 +3698,25 @@ def find_trailer_clips(
             "min_transition_score": round(min_tr, 3),
             "transition_edge_count": len(edge_scores),
             "transition_quality_ok": tr_ok,
+            # v3.2: debug / export
+            "is_degraded_preview": is_degraded_preview,
+            "export_decision": export_decision,
+            "export_decision_reasons": export_reasons,
+            "effective_target_duration": effective_target,
+            "original_target_duration": original_target,
+            "n_input_candidates": len(input_candidate_library),
+            "n_duplicates_removed": len(second_pass_trace["duplicate_removed"]),
+            "n_overlaps_removed": len(second_pass_trace["overlap_removed"]),
+            "sequence_valid": final_sequence_validation["sequence_valid"],
         },
     }
 
     logger.info(
-        f"Assembled: {len(trailer_clips)} clips, {total_dur:.1f}s | "
+        f"Assembled: {len(trailer_clips)} clips, {total_dur:.1f}s "
+        f"(effective_target={effective_target:.1f}s) | "
         f"mode={cfg.assembly_mode} spoiler={spoiler_agg:.2f} curiosity={curiosity_agg:.2f} "
-        f"themes={len(theme_blocks)} tease={has_tease}"
+        f"themes={len(theme_blocks)} tease={has_tease} "
+        f"degraded={is_degraded_preview} export={export_decision}"
     )
     logger.info("="*70)
     return result

@@ -243,7 +243,29 @@ STORY_SEGMENT_TYPES = {
         "max_duration": 30,
         "title_template": "Не история",
         "markers": []
-    }
+    },
+    # v2.1: lightweight subtypes for short/medium videos (< 3 min)
+    "micro_story": {
+        "weight": 0.95,
+        "min_duration": 12,
+        "max_duration": 45,
+        "title_template": "Микро-история: {summary}",
+        "markers": ["я", "мы", "было", "у меня", "представь"],
+    },
+    "case_fragment": {
+        "weight": 1.00,
+        "min_duration": 15,
+        "max_duration": 60,
+        "title_template": "Фрагмент кейса: {summary}",
+        "markers": ["клиент", "у нас был", "пример", "кейс", "сталкивался"],
+    },
+    "explanation_story": {
+        "weight": 0.90,
+        "min_duration": 15,
+        "max_duration": 75,
+        "title_template": "Разбор: {summary}",
+        "markers": ["объясняю", "разберём", "смысл в том", "причина", "потому что", "поэтому"],
+    },
 }
 
 
@@ -3708,10 +3730,25 @@ def find_story_moments(
         "short_for_type": 0,
         "low_narrative": 0,
         "low_export_safety": 0,
+        "weak_promoted_to_manual_review": 0,
     }
     narrative_scores_list: List[float] = []
     arc_patterns_list:     List[str]   = []
     pipeline_mode = "unknown"
+
+    # v2.1: diagnostics storage
+    rejected_arcs: List[Dict] = []
+    beat_to_arc_trace: List[Dict] = []
+    weak_story_pool: List[Dict] = []   # weak candidates for manual_review fallback
+
+    # v2.1: ease short_for_type для видео до 3 минут
+    short_video_duration_ease = video_duration_sec < 180.0
+    short_for_type_ease_factor = 0.50 if short_video_duration_ease else 1.0
+    if short_video_duration_ease:
+        logger.info(
+            f"short_video_duration_ease: video={video_duration_sec:.1f}s < 180s, "
+            f"type_min_duration × {short_for_type_ease_factor:.2f}"
+        )
 
     # =========================================================================
     # PRIMARY PIPELINE: event → beat → role → arc
@@ -3744,6 +3781,18 @@ def find_story_moments(
             arcs = build_story_arcs(beats, min_arc_completeness=0.35,
                                     max_arc_duration=cfg.max_clip_duration)
             logger.info(f"  Stage C: {len(arcs)} arc(s) assembled from {len(beats)} beats")
+
+            # v2.1: beat→arc trace for diagnostics
+            for arc in arcs:
+                beat_to_arc_trace.append({
+                    "arc_id": arc.get("arc_id"),
+                    "start": arc.get("start"),
+                    "end": arc.get("end"),
+                    "n_beats": arc.get("n_beats", 0),
+                    "arc_completeness": arc.get("arc_completeness", 0.0),
+                    "role_sequence": arc.get("role_sequence", []),
+                    "beat_starts": [b.get("start") for b in arc.get("beats", [])],
+                })
 
             pipeline_mode = "event_beat_arc"
 
@@ -3819,12 +3868,56 @@ def find_story_moments(
 
                     if story_type == "non_story":
                         filter_counts["non_story"] += 1
+                        rejected_arcs.append({
+                            "arc_id": arc.get("arc_id"),
+                            "start": refined_start, "end": refined_end,
+                            "duration_sec": round(duration_sec, 2),
+                            "reject_reason": "non_story",
+                            "story_type": story_type,
+                            "arc_pattern": arc_pattern,
+                            "transcript_preview": transcript[:80],
+                        })
                         continue
 
                     type_min_dur = STORY_SEGMENT_TYPES.get(story_type, {}).get("min_duration", 30)
-                    if duration_sec < type_min_dur:
+                    eff_type_min = type_min_dur * short_for_type_ease_factor
+
+                    if duration_sec < eff_type_min:
+                        # Hard reject — слишком короткий даже с relaxed порогом
                         filter_counts["short_for_type"] += 1
+                        rejected_arcs.append({
+                            "arc_id": arc.get("arc_id"),
+                            "start": refined_start, "end": refined_end,
+                            "duration_sec": round(duration_sec, 2),
+                            "reject_reason": "short_for_type",
+                            "story_type": story_type,
+                            "type_min_duration": type_min_dur,
+                            "eff_type_min": round(eff_type_min, 1),
+                            "arc_pattern": arc_pattern,
+                            "transcript_preview": transcript[:80],
+                        })
+                        # v2.1: всё равно сохраняем как weak для manual_review
+                        weak_story_pool.append({
+                            "start": refined_start, "end": refined_end,
+                            "duration_sec": round(duration_sec, 2),
+                            "arc_id": arc.get("arc_id"),
+                            "story_type": story_type,
+                            "arc_pattern": arc_pattern,
+                            "arc_completeness": arc.get("arc_completeness", 0.0),
+                            "reason_code": "weak_story_manual_review",
+                            "reject_reason_original": "short_for_type",
+                            "transcript_preview": transcript[:120],
+                            "arc_roles": arc.get("role_sequence", []),
+                        })
                         continue
+                    elif duration_sec < type_min_dur:
+                        # Soft pass (в диапазоне [eff_min, type_min]) — помечаем как относительно короткий,
+                        # но не режем
+                        logger.debug(
+                            f"  arc={arc.get('arc_id')} short-but-passed: "
+                            f"{duration_sec:.1f}s < type_min={type_min_dur}s "
+                            f"(eased to {eff_type_min:.1f}s)"
+                        )
 
                     # Narrative score — arc-aware path
                     narrative_score = compute_narrative_score(
@@ -4087,12 +4180,39 @@ def find_story_moments(
 
                 if _require_c_r:
                     if not has_conflict:
-                        filter_counts["no_conflict"]   += 1; continue
+                        filter_counts["no_conflict"]   += 1
+                        # v2.1: weak_story_pool если хотя бы какой-то evidence
+                        _setup_ev = float(story_structure.get("setup_evidence", 0.0))
+                        _progress_ev = story_structure.get("temporal_progression_evidence", False)
+                        if _setup_ev > 0.25 or _progress_ev:
+                            weak_story_pool.append({
+                                "start": start, "end": end,
+                                "duration_sec": round(duration_sec, 2),
+                                "story_type": "weak_fragment",
+                                "reason_code": "weak_story_manual_review",
+                                "reject_reason_original": "no_conflict",
+                                "setup_evidence": round(_setup_ev, 3),
+                                "has_temporal_progression": bool(_progress_ev),
+                                "transcript_preview": transcript[:120],
+                            })
+                        continue
                     if not has_resolution:
                         filter_counts["no_resolution"] += 1; continue
                 else:
                     if not has_conflict:
-                        filter_counts["no_conflict"] += 1; continue
+                        filter_counts["no_conflict"] += 1
+                        _setup_ev = float(story_structure.get("setup_evidence", 0.0))
+                        if _setup_ev > 0.25:
+                            weak_story_pool.append({
+                                "start": start, "end": end,
+                                "duration_sec": round(duration_sec, 2),
+                                "story_type": "weak_fragment",
+                                "reason_code": "weak_story_manual_review",
+                                "reject_reason_original": "no_conflict",
+                                "setup_evidence": round(_setup_ev, 3),
+                                "transcript_preview": transcript[:120],
+                            })
+                        continue
 
                 sentiment_curve = compute_sentiment_curve_from_asr(
                     asr_segments, start, end, min_segments=3,
@@ -4400,13 +4520,70 @@ def find_story_moments(
         else "text_markers_only"
     )
 
+    # =========================================================================
+    # v2.1: WEAK-STORY FALLBACK — если all_moments пуст, но есть weak_story_pool
+    # (rejected arcs / no_conflict windows с evidence), промоутируем top-3
+    # в manual_review.
+    # =========================================================================
+    weak_story_fallback_used = False
+    if not all_moments and weak_story_pool:
+        def _weak_rank(w: Dict) -> float:
+            return (
+                float(w.get("arc_completeness", 0.0)) * 0.60
+                + float(w.get("setup_evidence", 0.0)) * 0.25
+                + float(w.get("duration_sec", 0.0)) / 60.0 * 0.15
+            )
+        top_weak = sorted(weak_story_pool, key=_weak_rank, reverse=True)[:3]
+        for idx, wk in enumerate(top_weak):
+            ws = float(wk.get("start", 0.0))
+            we = float(wk.get("end", ws + cfg.min_clip_duration))
+            weak_moment = {
+                "start": round(ws, 2),
+                "end": round(we, 2),
+                "duration": round(max(0.0, we - ws), 2),
+                "score": round(_weak_rank(wk), 3),
+                "type": "story",
+                "story_type": wk.get("story_type", "weak_fragment"),
+                "arc_pattern": wk.get("arc_pattern", "flat"),
+                "arc_id": wk.get("arc_id"),
+                "arc_roles": wk.get("arc_roles", []),
+                "reasons": [{
+                    "code": "weak_story_manual_review",
+                    "message": f"Arc/fragment had signal but failed gate "
+                               f"(reject_reason_original={wk.get('reject_reason_original')})",
+                    "weight": 0.4,
+                }],
+                "export_decision": "manual_review",
+                "reject_reason_original": wk.get("reject_reason_original"),
+                "transcript": wk.get("transcript_preview", ""),
+                "summary": wk.get("transcript_preview", "")[:100],
+                "title": f"[Manual] {wk.get('story_type', 'Фрагмент')}",
+                "pipeline": "weak_story_fallback",
+                "is_weak_fallback": True,
+                "weak_rank": idx + 1,
+                "needs_manual_review": True,
+            }
+            all_moments.append(weak_moment)
+        weak_story_fallback_used = True
+        filter_counts["weak_promoted_to_manual_review"] = len(top_weak)
+        logger.info(
+            f"weak_story_manual_review fallback: promoted top-{len(top_weak)} "
+            f"weak stories to manual_review (from {len(weak_story_pool)} in pool)"
+        )
+
     logger.info(f"Result: {len(all_moments)} moment(s) | pipeline={pipeline_mode} | "
-                f"filters: {filter_counts} | fallback_top={fallback_origin_top_result}")
+                f"filters: {filter_counts} | fallback_top={fallback_origin_top_result} | "
+                f"weak_fb={weak_story_fallback_used}")
     logger.info("=" * 70)
 
     return {
         "mode":          "story",
         "story_moments": all_moments,
+        "rejected_arcs":         rejected_arcs,
+        "beat_to_arc_trace":     beat_to_arc_trace,
+        "weak_story_pool":       weak_story_pool,
+        "story_filter_reasons":  filter_counts,
+        "weak_story_fallback_used": weak_story_fallback_used,
         "stats": {
             "total_duration":                video_duration_sec,
             "profile_name":                  f"{cfg.mode_name} {cfg.profile_version}",
@@ -4428,6 +4605,10 @@ def find_story_moments(
             "export_decision_distribution":  export_decision_distribution,
             "event_recall_top_result":       event_recall_top_result,
             "arc_proposal_origin_top":       arc_proposal_origin_top,
+            "n_rejected_arcs":               len(rejected_arcs),
+            "n_weak_pool":                   len(weak_story_pool),
+            "weak_story_fallback_used":      weak_story_fallback_used,
+            "short_video_duration_ease":     short_video_duration_ease,
         },
     }
 

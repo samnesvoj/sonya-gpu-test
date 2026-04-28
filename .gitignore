@@ -1,15 +1,45 @@
+# Video files
+data/input/
+outputs/
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.mkv
+*.MKV
+*.avi
+*.AVI
+*.webm
+*.WEBM
+
+# Archives
+*.zip
+*.tar
+*.gz
+*.tar.gz
+
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
+
+# macOS junk
+._*
+.DS_Store
+
+# Env & secrets
 .env
 .env.local
-outputs/
-data/input/
-*.mp4
-*.avi
-*.mov
-*.mkv
-*.webm
-*.zip
-*.pt
+
+# Logs & DB
+*.log
 *.db
+
+# Model weights
+*.pt
+
+# Unrelated projects
+aminelli-site*/
+mulyazh_app*/
+SONYA-GPU-TEST/
+SONYA-DATASET/
