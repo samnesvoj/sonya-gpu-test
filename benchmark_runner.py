@@ -1609,6 +1609,14 @@ def run_single(
             run_dir / "degraded_preview_flag.json",
             {"is_degraded_preview": dbg["is_degraded_preview"]},
         )
+        # v3.3: hard repair artifacts
+        _raw_out = mode_result.get("_raw_mode_output") or {}
+        if _raw_out.get("final_repair_trace"):
+            _save_json(run_dir / "final_repair_trace.json", _raw_out["final_repair_trace"])
+        if _raw_out.get("overlap_repair_trace") is not None:
+            _save_json(run_dir / "overlap_repair_trace.json", _raw_out["overlap_repair_trace"])
+        if _raw_out.get("duration_trimmed") is not None:
+            _save_json(run_dir / "duration_trimmed.json", _raw_out["duration_trimmed"])
 
     # ── 4. Экспорт клипа ──────────────────────────────────────────────────────
     export_sec = 0.0

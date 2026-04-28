@@ -685,6 +685,31 @@ def _iou(a: Tuple[float,float], b: Tuple[float,float]) -> float:
     return 0.0 if union <= 0 else inter / union
 
 
+def _containment(a: Tuple[float,float], b: Tuple[float,float]) -> float:
+    """Fraction of the *shorter* clip that is covered by the other clip (0..1)."""
+    inter = max(0.0, min(a[1],b[1]) - max(a[0],b[0]))
+    shorter = min(a[1]-a[0], b[1]-b[0])
+    return 0.0 if shorter <= 0 else inter / shorter
+
+
+def _is_conflict(
+    a: Tuple[float,float],
+    b: Tuple[float,float],
+    min_overlap_sec: float = 2.0,
+    iou_thresh: float = 0.25,
+    containment_thresh: float = 0.60,
+) -> bool:
+    """
+    True if clips a and b should NOT coexist in the final sequence.
+    Conflict if: overlap > min_overlap_sec AND (iou > iou_thresh OR containment > containment_thresh).
+    This catches fully-nested short clips that pure IoU misses.
+    """
+    inter = max(0.0, min(a[1],b[1]) - max(a[0],b[0]))
+    if inter <= min_overlap_sec:
+        return False
+    return _iou(a, b) > iou_thresh or _containment(a, b) > containment_thresh
+
+
 def _nms(candidates: List[TrailerCandidate], thresh: float) -> List[TrailerCandidate]:
     s = sorted(candidates, key=lambda c: c.trailer_score_final, reverse=True)
     kept: List[TrailerCandidate] = []
@@ -3243,22 +3268,28 @@ def _second_pass_nms_and_dedupe(
     final_candidates: List["TrailerCandidate"],
     assignments: List["SlotAssignment"],
     overlap_iou_thresh: float = 0.35,
+    containment_thresh: float = 0.60,
+    min_overlap_sec: float = 2.0,
 ) -> Tuple[List["TrailerCandidate"], Dict[str, Any]]:
     """
     Второй pass NMS после slot assignment:
-      1. Если два кандидата пересекаются IoU > overlap_iou_thresh —
-         оставляем более короткий И с большим trailer_score_final.
-      2. Один и тот же candidate_id не может быть в нескольких slots одновременно.
-      3. Возвращает (kept_candidates, trace_dict) для debug.
+      1. Дубли по candidate_id убираются.
+      2. Overlap/containment: конфликт если overlap > min_overlap_sec AND
+         (iou > overlap_iou_thresh OR containment > containment_thresh).
+         Это ловит вложенные клипы, которые чистый IoU пропускает.
+      3. При конфликте: удаляем слабейший клип (по trailer_score_final).
+      4. Возвращает (kept_candidates, trace_dict).
     """
     trace: Dict[str, Any] = {
         "overlap_iou_thresh": overlap_iou_thresh,
+        "containment_thresh": containment_thresh,
+        "min_overlap_sec": min_overlap_sec,
         "input_count": len(final_candidates),
-        "duplicate_removed": [],      # дубли по candidate_id
-        "overlap_removed": [],        # убраны по IoU
+        "duplicate_removed": [],
+        "overlap_removed": [],
     }
 
-    # 1. Убираем дубли по candidate_id (не может быть в нескольких slots)
+    # 1. Убираем дубли по candidate_id
     seen_ids: set = set()
     dedup: List["TrailerCandidate"] = []
     for c in final_candidates:
@@ -3272,42 +3303,204 @@ def _second_pass_nms_and_dedupe(
         seen_ids.add(cid)
         dedup.append(c)
 
-    # 2. Second-pass NMS — сортируем по score desc, затем убираем overlap
+    # 2. Conflict NMS — сортируем по score desc
     sorted_by_score = sorted(dedup, key=lambda x: getattr(x, "trailer_score_final", 0.0), reverse=True)
     kept: List["TrailerCandidate"] = []
     for c in sorted_by_score:
-        overlap_with = None
+        conflict_with = None
         for k in kept:
-            if _iou((c.start, c.end), (k.start, k.end)) > overlap_iou_thresh:
-                overlap_with = k
+            if _is_conflict(
+                (c.start, c.end), (k.start, k.end),
+                min_overlap_sec=min_overlap_sec,
+                iou_thresh=overlap_iou_thresh,
+                containment_thresh=containment_thresh,
+            ):
+                conflict_with = k
                 break
-        if overlap_with is None:
+        if conflict_with is None:
             kept.append(c)
         else:
-            # Правило: если `c` короче И имеет >= score — заменяем. Иначе убираем `c`.
             c_score = getattr(c, "trailer_score_final", 0.0)
-            k_score = getattr(overlap_with, "trailer_score_final", 0.0)
+            k_score = getattr(conflict_with, "trailer_score_final", 0.0)
             c_dur = c.end - c.start
-            k_dur = overlap_with.end - overlap_with.start
-            if c_dur < k_dur and c_score >= k_score * 0.95:
-                kept.remove(overlap_with)
+            k_dur = conflict_with.end - conflict_with.start
+            overlap = max(0.0, min(c.end, conflict_with.end) - max(c.start, conflict_with.start))
+            iou_val = round(_iou((c.start, c.end), (conflict_with.start, conflict_with.end)), 3)
+            ct_val = round(_containment((c.start, c.end), (conflict_with.start, conflict_with.end)), 3)
+            # Keep higher-score; on tie keep longer (more content)
+            if c_score > k_score * 1.05 or (c_score >= k_score * 0.95 and c_dur < k_dur):
+                kept.remove(conflict_with)
                 kept.append(c)
                 trace["overlap_removed"].append({
-                    "candidate_id": getattr(overlap_with, "candidate_id", None),
-                    "start": overlap_with.start, "end": overlap_with.end,
+                    "candidate_id": getattr(conflict_with, "candidate_id", None),
+                    "start": conflict_with.start, "end": conflict_with.end,
+                    "score": round(k_score, 3),
                     "replaced_by": getattr(c, "candidate_id", None),
-                    "reason": "shorter_and_comparable_score",
+                    "reason": "lower_score_conflict",
+                    "iou": iou_val, "containment": ct_val, "overlap_sec": round(overlap, 2),
                 })
             else:
                 trace["overlap_removed"].append({
                     "candidate_id": getattr(c, "candidate_id", None),
                     "start": c.start, "end": c.end,
-                    "overlap_with": getattr(overlap_with, "candidate_id", None),
-                    "reason": "iou_exceeds_threshold",
+                    "score": round(c_score, 3),
+                    "conflict_with": getattr(conflict_with, "candidate_id", None),
+                    "reason": "conflict_lower_score_removed",
+                    "iou": iou_val, "containment": ct_val, "overlap_sec": round(overlap, 2),
                 })
 
     trace["output_count"] = len(kept)
     return sorted(kept, key=lambda c: c.start), trace
+
+
+_SLOT_PRIORITY: Dict[str, int] = {
+    "open_hook":           0,
+    "premise":             1,
+    "proof_moment":        2,
+    "tease_end":           3,
+    "escalation":          4,
+    "supporting_escalation": 5,
+    "backup_proof":        6,
+    "micro_tease":         7,
+}
+
+
+def _repair_sequence_hard(
+    candidates: List["TrailerCandidate"],
+    effective_target: float,
+    min_overlap_sec: float = 2.0,
+    iou_thresh: float = 0.25,
+    containment_thresh: float = 0.60,
+    trim_tolerance_sec: float = 1.5,
+    max_iter: int = 5,
+) -> Tuple[List["TrailerCandidate"], Dict[str, Any]]:
+    """
+    Hard repair loop: runs after second-pass NMS to guarantee
+    sequence_valid=True.
+
+    Each iteration:
+      1. Overlap repair  — remove weaker clip in any conflict pair.
+      2. Duration repair — if total_dur > effective_target:
+           a. Try trimming the last clip's end (if overshoot <= trim_tolerance_sec).
+           b. Otherwise remove the lowest-priority / lowest-score clip.
+
+    Returns (repaired_candidates, repair_trace).
+    repair_trace contains:
+      - overlap_repair_trace: list of removed overlap events
+      - duration_trimmed:     list of trim/remove events
+      - iterations:           how many passes were run
+      - sequence_valid_after: bool
+    """
+    repair_trace: Dict[str, Any] = {
+        "overlap_repair_trace": [],
+        "duration_trimmed": [],
+        "iterations": 0,
+        "input_count": len(candidates),
+        "sequence_valid_after": False,
+    }
+
+    work = list(candidates)
+
+    for _iter in range(max_iter):
+        repair_trace["iterations"] = _iter + 1
+        changed = False
+
+        # ── 1. Overlap repair ───────────────────────────────────────────────
+        work_sorted = sorted(work, key=lambda c: getattr(c, "trailer_score_final", 0.0), reverse=True)
+        clean: List["TrailerCandidate"] = []
+        for c in work_sorted:
+            conflict_with = None
+            for k in clean:
+                if _is_conflict(
+                    (c.start, c.end), (k.start, k.end),
+                    min_overlap_sec=min_overlap_sec,
+                    iou_thresh=iou_thresh,
+                    containment_thresh=containment_thresh,
+                ):
+                    conflict_with = k
+                    break
+            if conflict_with is None:
+                clean.append(c)
+            else:
+                # Remove weaker (c is already weaker because sorted desc)
+                overlap = max(0.0, min(c.end, conflict_with.end) - max(c.start, conflict_with.start))
+                ct = round(_containment((c.start, c.end), (conflict_with.start, conflict_with.end)), 3)
+                iou_v = round(_iou((c.start, c.end), (conflict_with.start, conflict_with.end)), 3)
+                repair_trace["overlap_repair_trace"].append({
+                    "removed": getattr(c, "candidate_id", None),
+                    "start": c.start, "end": c.end,
+                    "score": round(getattr(c, "trailer_score_final", 0.0), 3),
+                    "kept": getattr(conflict_with, "candidate_id", None),
+                    "overlap_sec": round(overlap, 2),
+                    "iou": iou_v, "containment": ct,
+                    "iteration": _iter + 1,
+                })
+                changed = True
+
+        work = sorted(clean, key=lambda c: c.start)
+
+        # ── 2. Duration repair ──────────────────────────────────────────────
+        total_dur = sum(c.end - c.start for c in work)
+        if total_dur > effective_target:
+            overshoot = total_dur - effective_target
+
+            if overshoot <= trim_tolerance_sec and work:
+                # Trim last clip's end
+                last = work[-1]
+                new_end = round(last.end - overshoot, 2)
+                if new_end > last.start + 3.0:  # keep at least 3s
+                    repair_trace["duration_trimmed"].append({
+                        "action": "trim_end",
+                        "candidate_id": getattr(last, "candidate_id", None),
+                        "old_end": last.end, "new_end": new_end,
+                        "overshoot_sec": round(overshoot, 2),
+                        "iteration": _iter + 1,
+                    })
+                    last.end = new_end
+                    last.duration = last.end - last.start
+                    changed = True
+            elif work:
+                # Remove lowest-priority / lowest-score clip
+                def _priority(c: "TrailerCandidate") -> Tuple[int, float]:
+                    slot = getattr(c, "assigned_slot", "") or ""
+                    prio = _SLOT_PRIORITY.get(slot, 99)
+                    score = getattr(c, "trailer_score_final", 0.0)
+                    return (prio, -score)  # highest prio number = remove first
+
+                to_remove = max(work, key=_priority)
+                repair_trace["duration_trimmed"].append({
+                    "action": "remove_clip",
+                    "candidate_id": getattr(to_remove, "candidate_id", None),
+                    "start": to_remove.start, "end": to_remove.end,
+                    "score": round(getattr(to_remove, "trailer_score_final", 0.0), 3),
+                    "slot": getattr(to_remove, "assigned_slot", None),
+                    "overshoot_sec": round(overshoot, 2),
+                    "iteration": _iter + 1,
+                })
+                work.remove(to_remove)
+                changed = True
+
+        # ── 3. Recheck ──────────────────────────────────────────────────────
+        total_dur = sum(c.end - c.start for c in work)
+        has_overlap = any(
+            _is_conflict(
+                (work[i].start, work[i].end), (work[j].start, work[j].end),
+                min_overlap_sec=min_overlap_sec,
+                iou_thresh=iou_thresh,
+                containment_thresh=containment_thresh,
+            )
+            for i in range(len(work))
+            for j in range(i + 1, len(work))
+        )
+        if not has_overlap and total_dur <= effective_target * 1.15:
+            repair_trace["sequence_valid_after"] = True
+            break
+        if not changed:
+            break  # can't improve further
+
+    repair_trace["output_count"] = len(work)
+    repair_trace["total_duration_after"] = round(sum(c.end - c.start for c in work), 2)
+    return work, repair_trace
 
 
 def _classify_trailer_export_decision(
@@ -3506,14 +3699,32 @@ def find_trailer_clips(
         if cfg.min_gap_between_clips > 0 and not _min_gap_ok(c, slot_selected, cfg.min_gap_between_clips): continue
         slot_selected.append(c); used_ids.add(c.candidate_id); current_dur+=c.duration
 
-    # v3.2: SECOND-PASS NMS — строже IoU (0.35) + dedupe по candidate_id
+    # v3.2: SECOND-PASS NMS — IoU(0.35) + containment(0.60) + dedupe по candidate_id
     slot_selected, second_pass_trace = _second_pass_nms_and_dedupe(
-        slot_selected, assignments, overlap_iou_thresh=0.35,
+        slot_selected, assignments,
+        overlap_iou_thresh=0.35, containment_thresh=0.60, min_overlap_sec=2.0,
     )
     logger.info(
         f"Second-pass NMS: {second_pass_trace['input_count']} → {second_pass_trace['output_count']} "
         f"(dup_removed={len(second_pass_trace['duplicate_removed'])}, "
         f"overlap_removed={len(second_pass_trace['overlap_removed'])})"
+    )
+
+    # v3.3: HARD REPAIR — loop until sequence_valid or max_iter
+    slot_selected, _hard_repair_trace = _repair_sequence_hard(
+        slot_selected,
+        effective_target=effective_target,
+        min_overlap_sec=2.0,
+        iou_thresh=0.25,
+        containment_thresh=0.60,
+        trim_tolerance_sec=1.5,
+        max_iter=5,
+    )
+    logger.info(
+        f"Hard repair: {_hard_repair_trace['input_count']} → {_hard_repair_trace['output_count']} "
+        f"(overlap_removed={len(_hard_repair_trace['overlap_repair_trace'])}, "
+        f"duration_ops={len(_hard_repair_trace['duration_trimmed'])}, "
+        f"valid={_hard_repair_trace['sequence_valid_after']})"
     )
 
     final_candidates = sorted(slot_selected, key=lambda c: c.start)
@@ -3641,6 +3852,9 @@ def find_trailer_clips(
         "overlap_removed": second_pass_trace["overlap_removed"],
         "duration_cap_trace": duration_cap_trace,
         "final_sequence_validation": final_sequence_validation,
+        "final_repair_trace": _hard_repair_trace,
+        "overlap_repair_trace": _hard_repair_trace["overlap_repair_trace"],
+        "duration_trimmed": _hard_repair_trace["duration_trimmed"],
         "is_degraded_preview": is_degraded_preview,
         "export_decision": export_decision,
         "export_decision_reasons": export_reasons,
