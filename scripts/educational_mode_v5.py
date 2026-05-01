@@ -63,6 +63,18 @@ if sys.platform == "win32":
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ── Shared audio cache (scripts/audio_cache.py) ──────────────────────────────
+_edu_scripts_dir = Path(__file__).resolve().parent
+if str(_edu_scripts_dir) not in sys.path:
+    sys.path.insert(0, str(_edu_scripts_dir))
+
+try:
+    from audio_cache import load_full_cached_audio as _load_full_cached_audio
+    _HAS_AUDIO_CACHE = True
+except ImportError:
+    _load_full_cached_audio = None  # type: ignore
+    _HAS_AUDIO_CACHE = False
+
 
 # =============================================================================
 # SEGMENT TYPE REGISTRY
@@ -281,13 +293,25 @@ class WindowContext:
 # =============================================================================
 
 def extract_audio_global(video_path: str) -> AudioGlobalData:
-    """Load audio once for the full video. Returns AudioGlobalData."""
+    """
+    Load audio once for the full video. Returns AudioGlobalData.
+
+    Uses shared audio_cache (scripts/audio_cache.py):
+    - ffmpeg extracts mono 16kHz WAV once (no PySoundFile/audioread on mp4)
+    - librosa loads the WAV once per process
+    Falls back to direct librosa.load(video_path) if audio_cache is unavailable.
+    """
     try:
-        import librosa
-        logger.info("Extracting full audio from video (one-shot)...")
-        y, sr = librosa.load(video_path, sr=16000, mono=True)
-        duration_sec = float(len(y) / sr)
-        logger.info(f"Audio extracted: {duration_sec:.1f}s @ {sr} Hz")
+        if _HAS_AUDIO_CACHE and _load_full_cached_audio is not None:
+            logger.info("Extracting full audio via shared audio_cache...")
+            y, sr = _load_full_cached_audio(video_path, sample_rate=16000)
+        else:
+            import librosa as _librosa
+            logger.info("Extracting full audio via direct librosa.load (audio_cache unavailable)...")
+            y, sr = _librosa.load(video_path, sr=16000, mono=True)
+
+        duration_sec = float(len(y) / max(sr, 1))
+        logger.info("Audio extracted from cached WAV: %.1fs @ %d Hz", duration_sec, sr)
         return AudioGlobalData(
             samples=y,
             sample_rate=sr,

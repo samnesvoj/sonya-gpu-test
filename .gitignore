@@ -1,5 +1,6 @@
-# Video files
+# Video / media
 data/input/
+data/archive/
 outputs/
 *.mp4
 *.MP4
@@ -17,35 +18,43 @@ outputs/
 *.tar
 *.gz
 *.tar.gz
+*.7z
 
-# Python cache
+# Python
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.mypy_cache/
 
-# macOS junk
+# OS junk
 ._*
 .DS_Store
+Thumbs.db
 
-# Env & secrets
+# Env / secrets
 .env
 .env.local
+.env.*
+*.env
 
-# Logs & DB
+# Logs / db
 *.log
 *.db
 
-# Model weights
+# Model weights / generated artifacts
 *.pt
+*.onnx
+*.engine
 
-# Unrelated projects
-aminelli-site*/
-mulyazh_app*/
-SONYA-GPU-TEST/
-SONYA-DATASET/
-
-# Backup folders and files
+# Backup folders/files
 backup*/
 backups*/
 *_backup*/
 *.bak
+
+# Unrelated local folders
+aminelli-site*/
+mulyazh_app*/
+SONYA-GPU-TEST/
+SONYA-DATASET/

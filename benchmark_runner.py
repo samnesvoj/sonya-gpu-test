@@ -29,8 +29,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
+import hashlib
 import json
 import os
+import platform
+import subprocess
 import sys
 import time
 import traceback
@@ -42,6 +46,124 @@ import cv2
 import numpy as np
 from loguru import logger
 from tqdm import tqdm
+
+# ── Shared audio cache ────────────────────────────────────────────────────────
+_scripts_path = Path(__file__).parent / "scripts"
+if str(_scripts_path) not in sys.path:
+    sys.path.insert(0, str(_scripts_path))
+
+try:
+    from audio_cache import get_audio_cache_manifest as _get_audio_cache_manifest
+    _HAS_AUDIO_CACHE = True
+except ImportError:
+    _get_audio_cache_manifest = None  # type: ignore
+    _HAS_AUDIO_CACHE = False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Run manifest helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _git_commit() -> str:
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.stdout.strip() if r.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _command_version(cmd: List[str]) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        out = (r.stdout or r.stderr or "").strip()
+        return out.splitlines()[0] if out else "unavailable"
+    except Exception:
+        return "unavailable"
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return "error"
+
+
+def _get_torch_info() -> Dict[str, Any]:
+    try:
+        import torch
+        return {
+            "torch_version": torch.__version__,
+            "cuda_available": bool(torch.cuda.is_available()),
+            "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        }
+    except Exception:
+        return {"torch_version": "unavailable", "cuda_available": False, "cuda_device_name": None}
+
+
+def _now_iso() -> str:
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+
+def _build_initial_manifest(
+    output_dir: Path,
+    video_files: List[Path],
+    modes: List[str],
+    model: str,
+    whisper_model: str,
+    strict_real: bool,
+    skip_export: bool,
+) -> Dict[str, Any]:
+    torch_info = _get_torch_info()
+    gpu_available, gpu_name, _ = _gpu_info()
+    video_entries = []
+    for vp in video_files:
+        try:
+            size_mb = round(vp.stat().st_size / 1024 / 1024, 2)
+        except Exception:
+            size_mb = 0.0
+        video_entries.append({
+            "filename": vp.name,
+            "path": str(vp),
+            "sha256": None,   # filled lazily after YOLO
+            "size_mb": size_mb,
+            "duration_sec": None,
+        })
+    return {
+        "run_id": output_dir.name,
+        "git_commit": _git_commit(),
+        "started_at": _now_iso(),
+        "finished_at": None,
+        "status": "running",
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "torch_version": torch_info["torch_version"],
+        "cuda_available": torch_info["cuda_available"],
+        "gpu_name": gpu_name,
+        "ffmpeg_version": _command_version(["ffmpeg", "-version"]),
+        "ffprobe_version": _command_version(["ffprobe", "-version"]),
+        "input_videos": video_entries,
+        "modes": modes,
+        "model": model,
+        "whisper_model": whisper_model,
+        "strict_real": strict_real,
+        "skip_export": skip_export,
+        "summary": {
+            "total_runs": 0,
+            "stub_count": 0,
+            "error_count": 0,
+            "exported_count": 0,
+        },
+    }
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GPU / VRAM мониторинг
@@ -1809,6 +1931,17 @@ def run_single(
         "opencv_frame_read_failures": base_analysis.get("opencv_frame_read_failures", 0),
         "yolo_device": base_analysis.get("yolo_device", "cpu"),
     }
+    # Audio cache diagnostics for viral and educational modes
+    if mode in ("viral", "educational") and _HAS_AUDIO_CACHE and _get_audio_cache_manifest:
+        try:
+            _manifest = _get_audio_cache_manifest()
+            _pipeline_trace["audio_cache"] = {
+                "enabled": bool(_manifest.get("enabled", False)),
+                "items_count": len(_manifest.get("items", [])),
+                "source": "cached_wav",
+            }
+        except Exception:
+            pass
     _save_json(run_dir / "pipeline_trace.json", _pipeline_trace)
 
     # Режим-специфичные артефакты
@@ -2192,11 +2325,18 @@ def main() -> None:
     parser.add_argument("--whisper-model", default="base",
                         choices=["tiny", "base", "small", "medium", "large"],
                         help="Размер Whisper: tiny/base = быстро, small/medium = качественнее")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume: reuse cached shared/base_analysis.json and shared/asr_segments.json "
+                             "from the same output dir (skip YOLO/ASR if cached)")
     args = parser.parse_args()
 
     videos_dir = Path(args.videos)
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── shared/ artifacts directory ──────────────────────────────────────────
+    shared_dir = output_dir / "shared"
+    shared_dir.mkdir(parents=True, exist_ok=True)
 
     video_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
     video_files = sorted([
@@ -2212,74 +2352,178 @@ def main() -> None:
     logger.info(f"GPU: {gpu_name} | VRAM: {vram_total:.0f} MB | Доступна: {gpu_available}")
     logger.info(f"Видео: {len(video_files)} | Режимы: {args.modes} | Модель: {args.model}")
     logger.info(f"Выход: {output_dir}")
+    if getattr(args, "resume", False):
+        logger.info("  --resume: will reuse cached shared/ artifacts if available")
 
     all_rows: List[Dict] = []
     total_runs = len(video_files) * len(args.modes)
-
-    # Whisper размер: base для быстрого теста, small/medium для качества
     whisper_model = getattr(args, "whisper_model", "base")
 
-    with tqdm(total=total_runs, desc="Прогоны") as pbar:
-        for video_path in video_files:
-            pbar.set_description(f"{video_path.name} — подготовка")
+    # ── run_manifest.json: initial write ─────────────────────────────────────
+    manifest = _build_initial_manifest(
+        output_dir=output_dir,
+        video_files=video_files,
+        modes=args.modes,
+        model=args.model,
+        whisper_model=whisper_model,
+        strict_real=getattr(args, "strict_real", False),
+        skip_export=getattr(args, "skip_export", False),
+    )
+    _save_json(output_dir / "run_manifest.json", manifest)
 
-            # ── Предвычисления на видео (один раз, общие для всех режимов) ──
-            logger.info(f"── Видео: {video_path.name} ──")
+    try:
+        with tqdm(total=total_runs, desc="Прогоны") as pbar:
+            for vid_idx, video_path in enumerate(video_files):
+                pbar.set_description(f"{video_path.name} — подготовка")
+                logger.info(f"── Видео: {video_path.name} ──")
 
-            pre_base_analysis, pre_yolo_sec = run_yolo_analysis(video_path, args.model)
-            pre_input_meta = extract_input_metadata(video_path)
-            pre_duration = pre_input_meta["duration_sec"]
+                pre_input_meta = extract_input_metadata(video_path)
+                pre_duration = pre_input_meta["duration_sec"]
 
-            logger.info(f"  YOLO готов за {pre_yolo_sec:.1f}s, длина видео {pre_duration:.1f}s")
+                # ── Update manifest video entry with duration ─────────────
+                if vid_idx < len(manifest["input_videos"]):
+                    manifest["input_videos"][vid_idx]["duration_sec"] = pre_duration
 
-            pre_asr_segments: List[Dict] = []
-            needs_asr = any(m in args.modes for m in ("hook", "story", "educational", "trailer_preview"))
-            if needs_asr:
-                logger.info("  Запуск ASR (Whisper)...")
-                pre_asr_segments, asr_elapsed = run_asr(video_path, whisper_model)
-                logger.info(f"  ASR готов за {asr_elapsed:.1f}s, сегментов: {len(pre_asr_segments)}")
+                # ── YOLO: resume or compute ───────────────────────────────
+                _resume = getattr(args, "resume", False)
+                pre_base_analysis = None
+                pre_yolo_sec = 0.0
+                _shared_ba = shared_dir / "base_analysis.json"
 
-            # Кеш результатов режимов для этого видео (нужен trailer)
-            mode_results_cache: Dict = {}
+                if _resume and _shared_ba.exists():
+                    try:
+                        with open(_shared_ba, encoding="utf-8") as _f:
+                            pre_base_analysis = json.load(_f)
+                        logger.info("Resume: using cached shared/base_analysis.json")
+                    except Exception as _e:
+                        logger.warning(f"Resume base_analysis invalid ({_e}), recalculating")
+                        pre_base_analysis = None
 
-            for mode in args.modes:
-                pbar.set_description(f"{video_path.name} / {mode}")
+                if pre_base_analysis is None:
+                    pre_base_analysis, pre_yolo_sec = run_yolo_analysis(video_path, args.model)
+                    logger.info(f"  YOLO готов за {pre_yolo_sec:.1f}s, длина видео {pre_duration:.1f}s")
+
+                # ── Save shared base_analysis.json ────────────────────────
+                _save_json(shared_dir / "base_analysis.json", pre_base_analysis)
+
+                # ── Save shared input_metadata.json ──────────────────────
+                _shared_input_meta = {
+                    "filename": video_path.name,
+                    "path": str(video_path),
+                    "duration_sec": pre_duration,
+                    "fps": pre_input_meta.get("fps", pre_base_analysis.get("source_fps")),
+                    "frame_count": pre_input_meta.get("frame_count",
+                                                       pre_base_analysis.get("source_frame_count")),
+                    "width": pre_input_meta.get("width", pre_base_analysis.get("source_width")),
+                    "height": pre_input_meta.get("height", pre_base_analysis.get("source_height")),
+                    "metadata_source": pre_base_analysis.get("metadata_source", "unknown"),
+                }
+                _save_json(shared_dir / "input_metadata.json", _shared_input_meta)
+
+                # ── ASR: resume or compute ────────────────────────────────
+                pre_asr_segments: List[Dict] = []
+                _shared_asr = shared_dir / "asr_segments.json"
+                needs_asr = any(m in args.modes for m in ("hook", "story", "educational", "trailer_preview"))
+
+                if _resume and _shared_asr.exists() and needs_asr:
+                    try:
+                        with open(_shared_asr, encoding="utf-8") as _f:
+                            _loaded_asr = json.load(_f)
+                        if isinstance(_loaded_asr, list):
+                            pre_asr_segments = _loaded_asr
+                            logger.info(f"Resume: using cached shared/asr_segments.json "
+                                        f"({len(pre_asr_segments)} segments)")
+                        else:
+                            raise ValueError("not a list")
+                    except Exception as _e:
+                        logger.warning(f"Resume asr_segments invalid ({_e}), recalculating")
+                        pre_asr_segments = []
+
+                if not pre_asr_segments and needs_asr:
+                    logger.info("  Запуск ASR (Whisper)...")
+                    pre_asr_segments, asr_elapsed = run_asr(video_path, whisper_model)
+                    logger.info(f"  ASR готов за {asr_elapsed:.1f}s, сегментов: {len(pre_asr_segments)}")
+
+                # ── Save shared asr_segments.json ─────────────────────────
+                _save_json(shared_dir / "asr_segments.json", pre_asr_segments)
+
+                # Кеш результатов режимов для этого видео (нужен trailer)
+                mode_results_cache: Dict = {}
+
+                for mode in args.modes:
+                    pbar.set_description(f"{video_path.name} / {mode}")
+                    try:
+                        row = run_single(
+                            video_path, mode, args.model, output_dir,
+                            video_duration_sec=pre_duration,
+                            base_analysis=pre_base_analysis,
+                            yolo_sec_precomputed=pre_yolo_sec,
+                            asr_segments=pre_asr_segments,
+                            mode_results_cache=mode_results_cache,
+                            skip_export=args.skip_export,
+                        )
+                        all_rows.append(row)
+                    except Exception as e:
+                        logger.error(f"ОШИБКА {video_path.name}/{mode}: {e}")
+                        logger.debug(traceback.format_exc())
+                        all_rows.append({
+                            "run_id": f"{video_path.stem}__{mode}__ERROR",
+                            "video": video_path.name,
+                            "mode": mode,
+                            "model": args.model,
+                            "error": str(e),
+                            "stub": True,
+                            "runtime_total_sec": 0,
+                            "yolo_sec": 0,
+                            "mode_logic_sec": 0,
+                            "export_sec": 0,
+                            "vram_peak_mb": 0,
+                            "gpu_available": gpu_available,
+                            "gpu_name": gpu_name,
+                            "num_candidates": 0,
+                            "top1_score": None,
+                            "export_decision": "error",
+                            "clip_exported": False,
+                            "maturity_level": 0,
+                            "output_dir": str(output_dir),
+                        })
+                    pbar.update(1)
+
+                # ── Save shared audio_cache_manifest.json ─────────────────
                 try:
-                    row = run_single(
-                        video_path, mode, args.model, output_dir,
-                        video_duration_sec=pre_duration,
-                        base_analysis=pre_base_analysis,
-                        yolo_sec_precomputed=pre_yolo_sec,
-                        asr_segments=pre_asr_segments,
-                        mode_results_cache=mode_results_cache,
-                        skip_export=args.skip_export,
+                    _audio_manifest = (
+                        _get_audio_cache_manifest()
+                        if (_HAS_AUDIO_CACHE and _get_audio_cache_manifest)
+                        else {"enabled": False, "items": []}
                     )
-                    all_rows.append(row)
-                except Exception as e:
-                    logger.error(f"ОШИБКА {video_path.name}/{mode}: {e}")
-                    logger.debug(traceback.format_exc())
-                    all_rows.append({
-                        "run_id": f"{video_path.stem}__{mode}__ERROR",
-                        "video": video_path.name,
-                        "mode": mode,
-                        "model": args.model,
-                        "error": str(e),
-                        "stub": True,
-                        "runtime_total_sec": 0,
-                        "yolo_sec": 0,
-                        "mode_logic_sec": 0,
-                        "export_sec": 0,
-                        "vram_peak_mb": 0,
-                        "gpu_available": gpu_available,
-                        "gpu_name": gpu_name,
-                        "num_candidates": 0,
-                        "top1_score": None,
-                        "export_decision": "error",
-                        "clip_exported": False,
-                        "maturity_level": 0,
-                        "output_dir": str(output_dir),
-                    })
-                pbar.update(1)
+                    _save_json(shared_dir / "audio_cache_manifest.json", _audio_manifest)
+                except Exception:
+                    _save_json(shared_dir / "audio_cache_manifest.json", {"enabled": False, "items": []})
+
+        # ── run_manifest: update summary on success ───────────────────────────
+        stub_count = sum(1 for r in all_rows if r.get("stub"))
+        error_count = sum(1 for r in all_rows if r.get("export_decision") == "error")
+        exported_count = sum(1 for r in all_rows if r.get("clip_exported"))
+        manifest["finished_at"] = _now_iso()
+        manifest["status"] = "success"
+        manifest["summary"] = {
+            "total_runs": len(all_rows),
+            "stub_count": stub_count,
+            "error_count": error_count,
+            "exported_count": exported_count,
+        }
+        _save_json(output_dir / "run_manifest.json", manifest)
+
+    except Exception as _main_exc:
+        # ── run_manifest: mark failed ──────────────────────────────────────
+        manifest["finished_at"] = _now_iso()
+        manifest["status"] = "failed"
+        manifest["error"] = str(_main_exc)
+        try:
+            _save_json(output_dir / "run_manifest.json", manifest)
+        except Exception:
+            pass
+        raise
 
     # ── Итоговые файлы ────────────────────────────────────────────────────────
     csv_path = save_summary_csv(all_rows, output_dir)
@@ -2296,6 +2540,8 @@ def main() -> None:
     logger.success(f"📋 runtime_breakdown.csv:    {rt_path}")
     logger.success(f"📋 model_comparison.csv:     {mc_path}")
     logger.success(f"📋 progress_report.txt:      {output_dir / 'progress_report.txt'}")
+    logger.success(f"📋 run_manifest.json:        {output_dir / 'run_manifest.json'}")
+    logger.success(f"📋 shared/:                  {shared_dir}")
     logger.success(f"\nДальше: заполни human_review_template.json в каждой run-папке")
     logger.success(f"{'='*60}")
 
@@ -2314,7 +2560,6 @@ def main() -> None:
                 f"{'='*60}"
             )
             logger.error(msg)
-            # Append to progress_report
             pr_path = output_dir / "progress_report.txt"
             try:
                 with open(pr_path, "a", encoding="utf-8") as _f:
