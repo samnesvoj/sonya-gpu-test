@@ -34,6 +34,7 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -168,6 +169,49 @@ def _build_initial_manifest(
             "exported_count": 0,
         },
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Export policy helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+VALID_EXPORT_POLICIES = {"all", "auto-only", "review-split", "none"}
+
+
+def _resolve_export_bucket(
+    export_decision: str,
+    export_policy: str,
+    skip_export: bool,
+) -> Optional[str]:
+    """
+    Determine the export bucket name for a given run, or None if no export.
+
+    Policies:
+      all          — export anything non-reject (backward compat)
+      auto-only    — only auto_export decision
+      review-split — auto_export → "auto", manual_review → "review"
+      none         — never export
+
+    Returns bucket name ("auto", "review", "all") or None.
+    """
+    if skip_export:
+        return None
+    if export_policy == "none":
+        return None
+    if export_policy not in VALID_EXPORT_POLICIES:
+        raise ValueError(f"Unknown export_policy: {export_policy!r}. "
+                         f"Must be one of {VALID_EXPORT_POLICIES}")
+    if export_policy == "all":
+        return None if export_decision == "reject" else "all"
+    if export_policy == "auto-only":
+        return "auto" if export_decision == "auto_export" else None
+    if export_policy == "review-split":
+        if export_decision == "auto_export":
+            return "auto"
+        if export_decision == "manual_review":
+            return "review"
+        return None
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1835,6 +1879,7 @@ def run_single(
     asr_segments: Optional[List[Dict]] = None,
     mode_results_cache: Optional[Dict] = None,
     skip_export: bool = False,
+    export_policy: str = "all",
 ) -> Dict[str, Any]:
     """
     Прогоняет одно видео через один режим.
@@ -1906,7 +1951,15 @@ def run_single(
 
     _save_json(run_dir / "candidates.json", candidates)
     _save_json(run_dir / "ranking.json", ranking)
-    _save_json(run_dir / "export_decision.json", {"decision": export_decision})
+    _save_json(run_dir / "export_decision.json", {
+        "decision": export_decision,
+        "export_policy": export_policy,
+        "export_bucket": export_bucket,
+        "export_path": export_path,
+        "legacy_output_path": str(output_mp4) if clip_exported else None,
+        "clip_exported": clip_exported,
+        "export_error": export_error,
+    })
     _save_json(run_dir / "boundary_diagnostics.json", boundary_diag)
 
     # ── Debug artifacts ───────────────────────────────────────────────────────
@@ -2011,11 +2064,41 @@ def run_single(
     export_sec = 0.0
     output_mp4 = run_dir / "output.mp4"
     clip_exported = False
+    export_bucket: Optional[str] = None
+    export_path: Optional[str] = None
+    export_error: Optional[str] = None
 
-    if not skip_export and top1 and export_decision != "reject":
+    _bucket = _resolve_export_bucket(export_decision, export_policy, skip_export)
+
+    if _bucket is not None and top1 and candidates:
         start = top1.get("start_sec", 0.0)
         end = top1.get("end_sec", start + 10.0)
+        # Export to mode run dir (legacy path, always)
         clip_exported, export_sec = export_clip(video_path, start, end, output_mp4)
+        if clip_exported:
+            export_bucket = _bucket
+            # Copy to exports/<bucket>/<mode>/<run_id>.mp4
+            try:
+                _bucket_dir = output_dir / "exports" / _bucket / mode
+                _bucket_dir.mkdir(parents=True, exist_ok=True)
+                _bucket_dest = _bucket_dir / f"{run_id}.mp4"
+                shutil.copy2(output_mp4, _bucket_dest)
+                export_path = str(_bucket_dest)
+            except Exception as _copy_exc:
+                export_error = str(_copy_exc)
+                logger.warning(f"[export] copy to bucket failed: {_copy_exc}")
+                export_path = str(output_mp4)  # fallback to legacy path
+
+    # Overwrite export_decision.json with real post-export values
+    _save_json(run_dir / "export_decision.json", {
+        "decision": export_decision,
+        "export_policy": export_policy,
+        "export_bucket": export_bucket,
+        "export_path": export_path,
+        "legacy_output_path": str(output_mp4) if clip_exported else None,
+        "clip_exported": clip_exported,
+        "export_error": export_error,
+    })
 
     vram_peak = max(_vram_used_mb(), vram_after_yolo) - vram_before
 
@@ -2054,6 +2137,9 @@ def run_single(
         "top1_score": top1_score,
         "export_decision": export_decision,
         "clip_exported": clip_exported,
+        "export_policy": export_policy,
+        "export_bucket": export_bucket,
+        "export_path": export_path,
         # Debug-сигналы фильтрации
         "raw_proposals_count": raw_proposals_count,
         "rejected_count": rejected_count,
@@ -2125,6 +2211,9 @@ def run_single(
         "top1_score": top1_score,
         "export_decision": export_decision,
         "clip_exported": clip_exported,
+        "export_policy": export_policy,
+        "export_bucket": export_bucket,
+        "export_path": export_path,
         "raw_proposals_count": raw_proposals_count,
         "rejected_count": rejected_count,
         "main_reject_reason": main_reject_reason,
@@ -2228,7 +2317,12 @@ def save_model_comparison(rows: List[Dict], output_dir: Path) -> Path:
     return path
 
 
-def save_progress_report(rows: List[Dict], output_dir: Path) -> None:
+def save_progress_report(
+    rows: List[Dict],
+    output_dir: Path,
+    export_policy: str = "all",
+    skip_export: bool = False,
+) -> None:
     """Текстовый отчёт с прогрессом по уровням для каждого режима."""
     by_mode: Dict[str, List[Dict]] = {}
     for r in rows:
@@ -2279,6 +2373,25 @@ def save_progress_report(rows: List[Dict], output_dir: Path) -> None:
             lines.append("  ⚠️  Все прогоны через заглушку — подключи реальный модуль")
 
         lines.append("")
+
+    # ── Export policy summary ─────────────────────────────────────────────────
+    _total_exported = sum(1 for r in rows if r.get("clip_exported"))
+    _by_bucket: Dict[str, int] = {}
+    for _r in rows:
+        if _r.get("clip_exported") and _r.get("export_bucket"):
+            _bk = _r["export_bucket"]
+            _by_bucket[_bk] = _by_bucket.get(_bk, 0) + 1
+
+    lines += ["─" * 70, "EXPORT POLICY", ""]
+    if skip_export:
+        lines.append("  skip_export: true")
+        lines.append("  exported total: 0")
+    else:
+        lines.append(f"  policy: {export_policy}")
+        lines.append(f"  exported total: {_total_exported}")
+        for _bkt, _cnt in sorted(_by_bucket.items()):
+            lines.append(f"  {_bkt}: {_cnt}")
+    lines.append("")
 
     lines += [
         "─" * 70,
@@ -2333,6 +2446,16 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true",
                         help="Resume: reuse cached shared/base_analysis.json and shared/asr_segments.json "
                              "from the same output dir (skip YOLO/ASR if cached)")
+    parser.add_argument("--export-policy", default="all",
+                        choices=["all", "auto-only", "review-split", "none"],
+                        help=(
+                            "Export policy: "
+                            "all=export non-reject (backward compat), "
+                            "auto-only=only auto_export decision, "
+                            "review-split=auto→exports/auto/ manual→exports/review/, "
+                            "none=no export. "
+                            "--skip-export overrides this."
+                        ))
     args = parser.parse_args()
 
     videos_dir = Path(args.videos)
@@ -2364,6 +2487,17 @@ def main() -> None:
     total_runs = len(video_files) * len(args.modes)
     whisper_model = getattr(args, "whisper_model", "base")
 
+    # Effective export policy (skip_export overrides everything)
+    export_policy: str = getattr(args, "export_policy", "all")
+    _effective_skip = getattr(args, "skip_export", False)
+    if _effective_skip:
+        _effective_export_policy = "none"
+    else:
+        _effective_export_policy = export_policy
+
+    logger.info(f"  Export policy: {export_policy} | skip_export={_effective_skip} | "
+                f"effective={_effective_export_policy}")
+
     # ── run_manifest.json: initial write ─────────────────────────────────────
     manifest = _build_initial_manifest(
         output_dir=output_dir,
@@ -2372,8 +2506,10 @@ def main() -> None:
         model=args.model,
         whisper_model=whisper_model,
         strict_real=getattr(args, "strict_real", False),
-        skip_export=getattr(args, "skip_export", False),
+        skip_export=_effective_skip,
     )
+    manifest["export_policy"] = export_policy
+    manifest["effective_export_policy"] = _effective_export_policy
     _save_json(output_dir / "run_manifest.json", manifest)
 
     try:
@@ -2465,7 +2601,8 @@ def main() -> None:
                             yolo_sec_precomputed=pre_yolo_sec,
                             asr_segments=pre_asr_segments,
                             mode_results_cache=mode_results_cache,
-                            skip_export=args.skip_export,
+                            skip_export=_effective_skip,
+                            export_policy=_effective_export_policy,
                         )
                         all_rows.append(row)
                     except Exception as e:
@@ -2505,12 +2642,45 @@ def main() -> None:
                 except Exception:
                     _save_json(shared_dir / "audio_cache_manifest.json", {"enabled": False, "items": []})
 
+        # ── exports_manifest.json ─────────────────────────────────────────────
+        _exported_rows = [r for r in all_rows if r.get("clip_exported")]
+        _by_bucket: Dict[str, int] = {}
+        _exports_items = []
+        for _er in _exported_rows:
+            _bkt = _er.get("export_bucket") or "all"
+            _by_bucket[_bkt] = _by_bucket.get(_bkt, 0) + 1
+            _exports_items.append({
+                "run_id": _er.get("run_id", ""),
+                "video": _er.get("video", ""),
+                "mode": _er.get("mode", ""),
+                "export_decision": _er.get("export_decision", ""),
+                "bucket": _bkt,
+                "path": _er.get("export_path"),
+                "legacy_output_path": str(Path(_er.get("output_dir", "")) / "output.mp4")
+                    if _er.get("output_dir") else None,
+                "duration_sec": None,   # populated from top1 if available
+                "top1_score": _er.get("top1_score"),
+            })
+        _exports_manifest = {
+            "export_policy": export_policy,
+            "effective_export_policy": _effective_export_policy,
+            "skip_export": _effective_skip,
+            "total_exported": len(_exported_rows),
+            "by_bucket": _by_bucket,
+            "items": _exports_items,
+        }
+        _save_json(output_dir / "exports_manifest.json", _exports_manifest)
+
         # ── run_manifest: update summary on success ───────────────────────────
         stub_count = sum(1 for r in all_rows if r.get("stub"))
         error_count = sum(1 for r in all_rows if r.get("export_decision") == "error")
-        exported_count = sum(1 for r in all_rows if r.get("clip_exported"))
+        exported_count = len(_exported_rows)
         manifest["finished_at"] = _now_iso()
         manifest["status"] = "success"
+        manifest["exports"] = {
+            "total_exported": exported_count,
+            "by_bucket": _by_bucket,
+        }
         manifest["summary"] = {
             "total_runs": len(all_rows),
             "stub_count": stub_count,
@@ -2528,6 +2698,17 @@ def main() -> None:
             _save_json(output_dir / "run_manifest.json", manifest)
         except Exception:
             pass
+        try:
+            _save_json(output_dir / "exports_manifest.json", {
+                "export_policy": export_policy,
+                "skip_export": _effective_skip,
+                "total_exported": 0,
+                "by_bucket": {},
+                "items": [],
+                "status": "failed",
+            })
+        except Exception:
+            pass
         raise
 
     # ── Итоговые файлы ────────────────────────────────────────────────────────
@@ -2535,7 +2716,8 @@ def main() -> None:
     fb_path = save_failure_breakdown(all_rows, output_dir)
     rt_path = save_runtime_breakdown(all_rows, output_dir)
     mc_path = save_model_comparison(all_rows, output_dir)
-    save_progress_report(all_rows, output_dir)
+    save_progress_report(all_rows, output_dir,
+                         export_policy=export_policy, skip_export=_effective_skip)
 
     logger.success(f"\n{'='*60}")
     logger.success(f"✅ Готово! Прогонов: {len(all_rows)}")
@@ -2546,6 +2728,7 @@ def main() -> None:
     logger.success(f"📋 model_comparison.csv:     {mc_path}")
     logger.success(f"📋 progress_report.txt:      {output_dir / 'progress_report.txt'}")
     logger.success(f"📋 run_manifest.json:        {output_dir / 'run_manifest.json'}")
+    logger.success(f"📋 exports_manifest.json:    {output_dir / 'exports_manifest.json'}")
     logger.success(f"📋 shared/:                  {shared_dir}")
     logger.success(f"\nДальше: заполни human_review_template.json в каждой run-папке")
     logger.success(f"{'='*60}")
