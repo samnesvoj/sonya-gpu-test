@@ -120,18 +120,168 @@ def extract_input_metadata(video_path: Path) -> Dict[str, Any]:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # YOLO базовый анализ (общий для всех режимов)
+# Long-video safe mode: sparse sampling, ffprobe metadata, ffmpeg fallback
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _ffprobe_metadata(video_path: Path) -> Dict[str, Any]:
+    """
+    Получает точные метаданные видео через ffprobe.
+    Возвращает dict с duration_sec, fps, frame_count, width, height.
+    OpenCV используется как fallback если ffprobe недоступен.
+    """
+    meta: Dict[str, Any] = {
+        "duration_sec": 0.0, "fps": 25.0,
+        "frame_count": 0, "width": 0, "height": 0,
+        "source": "opencv_fallback",
+    }
+    try:
+        import subprocess as _sp, json as _json
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,r_frame_rate,nb_frames:format=duration",
+            "-of", "json", str(video_path),
+        ]
+        r = _sp.run(cmd, capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            data = _json.loads(r.stdout)
+            fmt = data.get("format", {})
+            streams = data.get("streams", [{}])
+            st = streams[0] if streams else {}
+            dur = float(fmt.get("duration") or st.get("duration") or 0)
+            rfr = st.get("r_frame_rate", "25/1")
+            try:
+                num, den = rfr.split("/")
+                fps = float(num) / max(float(den), 1e-6)
+            except Exception:
+                fps = 25.0
+            nb = st.get("nb_frames")
+            frame_count = int(nb) if nb and nb != "N/A" else int(dur * fps)
+            meta.update({
+                "duration_sec": round(dur, 3),
+                "fps": round(fps, 3),
+                "frame_count": frame_count,
+                "width": int(st.get("width", 0)),
+                "height": int(st.get("height", 0)),
+                "source": "ffprobe",
+            })
+            return meta
+    except Exception:
+        pass
+
+    # OpenCV fallback
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        cap.release()
+        meta.update({
+            "duration_sec": round(fc / fps if fps > 0 else 0.0, 3),
+            "fps": round(fps, 3),
+            "frame_count": fc,
+            "width": w,
+            "height": h,
+            "source": "opencv_fallback",
+        })
+    except Exception:
+        pass
+    return meta
+
+
+def _video_analysis_params(duration_sec: float) -> Dict[str, Any]:
+    """
+    Определяет параметры семплирования в зависимости от длины видео.
+    Возвращает: video_analysis_mode, max_frames, sampling_interval_sec
+    """
+    if duration_sec <= 600:
+        return {
+            "video_analysis_mode": "standard",
+            "max_frames": 300,
+            "sampling_interval_sec": 2.0,
+        }
+    elif duration_sec <= 1200:
+        max_frames = 300
+        interval = max(5.0, duration_sec / max_frames)
+        return {
+            "video_analysis_mode": "sparse_long_video",
+            "max_frames": max_frames,
+            "sampling_interval_sec": round(interval, 2),
+        }
+    else:
+        max_frames = 200
+        interval = max(5.0, duration_sec / max_frames)
+        return {
+            "video_analysis_mode": "sparse_long_video",
+            "max_frames": max_frames,
+            "sampling_interval_sec": round(interval, 2),
+        }
+
+
+def _run_yolo_on_frame(
+    yolo: Any,
+    frame: np.ndarray,
+    timestamp_sec: float,
+    _real_visual_fn: Any,
+    _prev_gray: Any,
+) -> Tuple[Dict[str, Any], Any]:
+    """Run YOLO + optional real_visual on one frame. Returns (det, new_prev_gray)."""
+    det: Dict[str, Any] = {
+        "timestamp_sec": round(timestamp_sec, 2),
+        "person_count": 0,
+        "objects": [],
+        "confidence_max": 0.0,
+    }
+    yolo_dets_for_visual: List[Dict] = []
+    try:
+        results = yolo(frame, verbose=False)
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                cls_name = yolo.names.get(cls_id, str(cls_id))
+                det["objects"].append({"class": cls_name, "confidence": round(conf, 3)})
+                if cls_name == "person":
+                    det["person_count"] += 1
+                det["confidence_max"] = max(det["confidence_max"], conf)
+                if hasattr(box, "xyxy"):
+                    xy = box.xyxy[0].cpu().numpy().tolist()
+                    yolo_dets_for_visual.append({"bbox": xy})
+    except Exception:
+        pass
+
+    new_prev_gray = _prev_gray
+    if _real_visual_fn is not None:
+        try:
+            vm = _real_visual_fn(frame, _prev_gray, yolo_dets_for_visual)
+            det["action_intensity"] = round(vm["action_intensity"], 4)
+            det["emotional_peaks"] = round(vm["emotional_peaks"], 4)
+            det["composition_score"] = round(vm["composition_score"], 4)
+            new_prev_gray = vm["current_gray"]
+        except Exception:
+            new_prev_gray = None
+
+    return det, new_prev_gray
+
 
 def run_yolo_analysis(
     video_path: Path, model_name: str
 ) -> Tuple[Dict[str, Any], float]:
     """
-    Прогоняет YOLOv8 по ключевым кадрам видео.
-    Возвращает (base_analysis_dict, elapsed_sec).
+    Long-video safe YOLO analysis.
+
+    Sampling strategy:
+      ≤ 600s  → standard mode, every 2s (≤300 frames)
+      ≤1200s  → sparse mode, every max(5s, dur/300) (≤300 frames)
+      >1200s  → sparse mode, every max(5s, dur/200) (≤200 frames)
+
+    Metadata: ffprobe first, OpenCV fallback.
+    Frame read: sampled timestamps via cap.set(POS_MSEC), not sequential.
+    If OpenCV fails (< 10% expected frames read): ffmpeg jpg fallback.
     """
     t0 = time.perf_counter()
 
-    # real_visual_metrics: optical flow + face detection per frame (опционально)
     try:
         from real_visual_metrics import compute_all_frame_metrics as _real_visual_fn
         _has_real_visual = True
@@ -139,84 +289,170 @@ def run_yolo_analysis(
         _real_visual_fn = None
         _has_real_visual = False
 
+    # ── Step 1: video metadata ─────────────────────────────────────────────────
+    vmeta = _ffprobe_metadata(video_path)
+    duration_sec = vmeta["duration_sec"]
+    source_fps = vmeta["fps"]
+    source_frame_count = vmeta["frame_count"]
+
+    # ── Step 2: sampling params ────────────────────────────────────────────────
+    params = _video_analysis_params(duration_sec)
+    mode_label = params["video_analysis_mode"]
+    max_frames = params["max_frames"]
+    interval_sec = params["sampling_interval_sec"]
+
+    # Build list of sample timestamps (seconds)
+    sample_timestamps: List[float] = []
+    t = 0.0
+    while t < duration_sec and len(sample_timestamps) < max_frames:
+        sample_timestamps.append(round(t, 3))
+        t += interval_sec
+    target_count = len(sample_timestamps)
+
+    logger.info(f"  Video duration: {duration_sec:.1f}s | mode={mode_label} | "
+                f"interval={interval_sec}s | target={target_count} frames")
+
+    # ── Step 3: load YOLO ──────────────────────────────────────────────────────
     try:
         from ultralytics import YOLO
-
         model_file = model_name if model_name.endswith(".pt") else f"{model_name}.pt"
         scripts_dir = Path(__file__).parent
         model_path = scripts_dir / model_file
         if not model_path.exists():
-            model_path = model_file  # позволяем YOLO скачать самостоятельно
-
+            model_path = Path(model_file)
         yolo = YOLO(str(model_path))
-
-        cap = cv2.VideoCapture(str(video_path))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        sample_step = max(1, int(fps * 2))  # каждые 2 секунды
-
-        detections = []
-        frame_idx = 0
-        _prev_gray = None  # для optical flow
-        while frame_idx < total_frames:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                break
-            results = yolo(frame, verbose=False)
-            timestamp = frame_idx / fps
-            det = {
-                "timestamp_sec": round(timestamp, 2),
-                "person_count": 0,
-                "objects": [],
-                "confidence_max": 0.0,
-            }
-            yolo_dets_for_visual = []
-            for r in results:
-                for box in r.boxes:
-                    cls_id = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    cls_name = yolo.names.get(cls_id, str(cls_id))
-                    det["objects"].append({"class": cls_name, "confidence": round(conf, 3)})
-                    if cls_name == "person":
-                        det["person_count"] += 1
-                    det["confidence_max"] = max(det["confidence_max"], conf)
-                    if hasattr(box, "xyxy"):
-                        xy = box.xyxy[0].cpu().numpy().tolist()
-                        yolo_dets_for_visual.append({"bbox": xy})
-
-            # Реальные визуальные метрики (optical flow, faces, rule-of-thirds)
-            if _has_real_visual and _real_visual_fn is not None:
-                try:
-                    vm = _real_visual_fn(frame, _prev_gray, yolo_dets_for_visual)
-                    det["action_intensity"] = round(vm["action_intensity"], 4)
-                    det["emotional_peaks"] = round(vm["emotional_peaks"], 4)
-                    det["composition_score"] = round(vm["composition_score"], 4)
-                    _prev_gray = vm["current_gray"]
-                except Exception:
-                    _prev_gray = None
-
-            detections.append(det)
-            frame_idx += sample_step
-        cap.release()
-
-        person_frames = [d for d in detections if d["person_count"] > 0]
-        elapsed = time.perf_counter() - t0
-        return {
-            "model": model_name,
-            "total_frames_sampled": len(detections),
-            "person_presence_ratio": round(len(person_frames) / max(len(detections), 1), 3),
-            "avg_confidence": round(
-                np.mean([d["confidence_max"] for d in detections]) if detections else 0, 3
-            ),
-            "has_real_visual_metrics": _has_real_visual,
-            "detections": detections,
-        }, elapsed
-
+        # detect device
+        try:
+            import torch
+            yolo_device = "0" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            yolo_device = "cpu"
     except Exception as e:
         elapsed = time.perf_counter() - t0
-        logger.warning(f"YOLO analysis failed: {e}")
-        return {"model": model_name, "error": str(e), "detections": []}, elapsed
+        logger.warning(f"YOLO load failed: {e}")
+        return {"model": model_name, "error": str(e), "detections": [],
+                "video_analysis_mode": mode_label, "video_duration_sec": duration_sec}, elapsed
+
+    # ── Step 4: OpenCV sparse seek ─────────────────────────────────────────────
+    detections: List[Dict] = []
+    read_failures = 0
+    opencv_used = True
+    ffmpeg_fallback_used = False
+    _prev_gray = None
+    log_interval = max(1, target_count // 4)
+
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError("cv2.VideoCapture failed to open")
+
+        for i, ts in enumerate(sample_timestamps):
+            cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                read_failures += 1
+                continue
+
+            det, _prev_gray = _run_yolo_on_frame(yolo, frame, ts, _real_visual_fn, _prev_gray)
+            detections.append(det)
+
+            if (i + 1) % log_interval == 0 or (i + 1) == target_count:
+                logger.info(f"  Sampled frames: {i + 1}/{target_count} "
+                            f"(read_ok={len(detections)}, failures={read_failures})")
+
+        cap.release()
+    except Exception as cap_exc:
+        logger.warning(f"  OpenCV read error: {cap_exc} — will try ffmpeg fallback")
+        detections = []
+        read_failures = target_count
+
+    # ── Step 5: ffmpeg fallback (if OpenCV gave < 10% expected frames) ─────────
+    if len(detections) < max(1, target_count * 0.10):
+        logger.warning(
+            f"  OpenCV read rate too low ({len(detections)}/{target_count}) "
+            f"— switching to ffmpeg frame extraction fallback"
+        )
+        ffmpeg_fallback_used = True
+        opencv_used = False
+        detections = []
+        _prev_gray = None
+        read_failures = 0
+
+        import tempfile
+        import shutil
+        import subprocess as _sp
+        tmp_dir = Path(tempfile.mkdtemp(prefix="sonya_yolo_"))
+        try:
+            # extract sparse frames to jpg
+            vf_filter = f"fps=1/{interval_sec:.1f},scale=1280:-2"
+            ffmpeg_cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                "-fflags", "+genpts", "-err_detect", "ignore_err",
+                "-i", str(video_path),
+                "-vf", vf_filter,
+                "-frames:v", str(max_frames),
+                "-q:v", "3",
+                str(tmp_dir / "frame_%06d.jpg"),
+            ]
+            _sp.run(ffmpeg_cmd, timeout=300, check=False,
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+
+            jpg_files = sorted(tmp_dir.glob("frame_*.jpg"))
+            logger.info(f"  ffmpeg extracted {len(jpg_files)} frames to {tmp_dir}")
+
+            for i, jpg_path in enumerate(jpg_files):
+                frame = cv2.imread(str(jpg_path))
+                if frame is None:
+                    read_failures += 1
+                    continue
+                ts = i * interval_sec
+                det, _prev_gray = _run_yolo_on_frame(yolo, frame, ts, _real_visual_fn, _prev_gray)
+                detections.append(det)
+
+                if (i + 1) % log_interval == 0 or (i + 1) == len(jpg_files):
+                    logger.info(f"  [ffmpeg] Processed frames: {i + 1}/{len(jpg_files)}")
+        except Exception as ffmpeg_exc:
+            logger.error(f"  ffmpeg fallback also failed: {ffmpeg_exc}")
+        finally:
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    # ── Step 6: aggregate results ──────────────────────────────────────────────
+    person_frames = [d for d in detections if d["person_count"] > 0]
+    elapsed = time.perf_counter() - t0
+
+    logger.info(
+        f"  YOLO done: {len(detections)} frames in {elapsed:.1f}s | "
+        f"person_ratio={round(len(person_frames)/max(len(detections),1),3)} | "
+        f"opencv={opencv_used} ffmpeg_fallback={ffmpeg_fallback_used}"
+    )
+
+    return {
+        # Legacy fields (unchanged for mode compatibility)
+        "model": model_name,
+        "total_frames_sampled": len(detections),
+        "person_presence_ratio": round(len(person_frames) / max(len(detections), 1), 3),
+        "avg_confidence": round(
+            float(np.mean([d["confidence_max"] for d in detections])) if detections else 0.0, 3
+        ),
+        "has_real_visual_metrics": _has_real_visual,
+        "detections": detections,
+        # New diagnostic fields (v3.4)
+        "video_analysis_mode": mode_label,
+        "video_duration_sec": round(duration_sec, 2),
+        "source_fps": round(source_fps, 3),
+        "source_frame_count": source_frame_count,
+        "target_sampled_frames": target_count,
+        "sampled_frames_count": len(detections),
+        "sampling_interval_sec": interval_sec,
+        "opencv_used": opencv_used,
+        "ffmpeg_fallback_used": ffmpeg_fallback_used,
+        "opencv_frame_read_failures": read_failures,
+        "yolo_device": yolo_device,
+        "metadata_source": vmeta.get("source", "unknown"),
+    }, elapsed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1501,6 +1737,8 @@ def run_single(
     else:
         yolo_sec = yolo_sec_precomputed
     vram_after_yolo = _vram_used_mb()
+    # Сохраняем base_analysis в output run folder для диагностики
+    _save_json(run_dir / "base_analysis.json", base_analysis)
 
     # ── 3. Режим ──────────────────────────────────────────────────────────────
     runner = MODE_RUNNERS.get(mode)
@@ -1551,13 +1789,26 @@ def run_single(
     _save_json(run_dir / "raw_proposals.json", dbg["raw_proposals"])
     _save_json(run_dir / "rejected_candidates.json", dbg["rejected_candidates"])
     _save_json(run_dir / "filter_reasons.json", dbg["filter_reasons"])
-    # Inject error info into pipeline_trace so ChatGPT sees it
+    # Inject error info + base_analysis diagnostics into pipeline_trace
     _pipeline_trace = dict(dbg["pipeline_trace"])
     if _error_tb:
         _pipeline_trace["stub_mode"] = True
         _pipeline_trace["adapter_error"] = mode_result.get("adapter_error")
         _pipeline_trace["error_traceback_saved"] = "error_traceback.txt"
         _pipeline_trace["main_reject_reason"] = mode_result.get("main_reject_reason")
+    # Embed base_analysis diagnostics so every mode's pipeline_trace is self-contained
+    _pipeline_trace["base_analysis"] = {
+        "video_analysis_mode": base_analysis.get("video_analysis_mode", "unknown"),
+        "video_duration_sec": base_analysis.get("video_duration_sec", 0.0),
+        "target_sampled_frames": base_analysis.get("target_sampled_frames", 0),
+        "sampled_frames_count": base_analysis.get("sampled_frames_count",
+                                                    base_analysis.get("total_frames_sampled", 0)),
+        "sampling_interval_sec": base_analysis.get("sampling_interval_sec", 2.0),
+        "opencv_used": base_analysis.get("opencv_used", True),
+        "ffmpeg_fallback_used": base_analysis.get("ffmpeg_fallback_used", False),
+        "opencv_frame_read_failures": base_analysis.get("opencv_frame_read_failures", 0),
+        "yolo_device": base_analysis.get("yolo_device", "cpu"),
+    }
     _save_json(run_dir / "pipeline_trace.json", _pipeline_trace)
 
     # Режим-специфичные артефакты

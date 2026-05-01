@@ -43,3 +43,9 @@ aminelli-site*/
 mulyazh_app*/
 SONYA-GPU-TEST/
 SONYA-DATASET/
+
+# Backup folders and files
+backup*/
+backups*/
+*_backup*/
+*.bak
