@@ -9,8 +9,12 @@ Version: 3.0 (Production)
 
 import sys
 import json
+import hashlib as _hashlib
+import tempfile as _tempfile
+import subprocess as _subprocess
+import shutil as _shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 # Audio/ML imports (опциональны, с fallback)
 try:
@@ -19,7 +23,105 @@ try:
     HAS_AUDIO = True
 except ImportError:
     HAS_AUDIO = False
+    np = None  # type: ignore
     print("Warning: librosa/numpy not installed. Audio features will use fallback values.")
+
+# ─── Module-level audio caches (keyed by video_path string) ─────────────────
+# _AUDIO_WAV_PATH_CACHE: video_path → Path to extracted .wav
+# _AUDIO_LOADED_CACHE:  video_path → (y_full: np.ndarray, sr: int)
+_AUDIO_WAV_PATH_CACHE: Dict[str, Path] = {}
+_AUDIO_LOADED_CACHE: Dict[str, Any] = {}
+
+
+def get_cached_audio_wav(
+    video_path: str,
+    cache_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """
+    Extract mono 16kHz WAV from video via ffmpeg, with file-system caching.
+    Returns Path to WAV, or None on failure.
+    Avoids PySoundFile/audioread issues with mp4 by producing a plain WAV.
+    """
+    video_str = str(video_path)
+
+    # Check in-process cache first
+    if video_str in _AUDIO_WAV_PATH_CACHE:
+        cached = _AUDIO_WAV_PATH_CACHE[video_str]
+        if Path(cached).exists():
+            print(f"  [audio_cache] reused (in-process): {Path(cached).name}")
+            return Path(cached)
+
+    # Determine cache directory
+    if cache_dir is None:
+        cache_dir = Path(_tempfile.gettempdir()) / "sonya_audio_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stable filename based on video path hash
+    path_hash = _hashlib.md5(video_str.encode("utf-8")).hexdigest()[:14]
+    wav_path = cache_dir / f"audio_{path_hash}.wav"
+
+    if wav_path.exists() and wav_path.stat().st_size > 0:
+        print(f"  [audio_cache] reused WAV on disk: {wav_path.name}")
+        _AUDIO_WAV_PATH_CACHE[video_str] = wav_path
+        return wav_path
+
+    # Extract via ffmpeg
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", video_str,
+            "-vn", "-ac", "1", "-ar", "16000",
+            "-acodec", "pcm_s16le",
+            str(wav_path),
+        ]
+        result = _subprocess.run(cmd, timeout=180, capture_output=True)
+        if result.returncode == 0 and wav_path.exists() and wav_path.stat().st_size > 0:
+            size_kb = wav_path.stat().st_size // 1024
+            print(f"  [audio_cache] audio_cache_created: {wav_path.name} ({size_kb} KB)")
+            _AUDIO_WAV_PATH_CACHE[video_str] = wav_path
+            return wav_path
+        else:
+            err = result.stderr.decode(errors="replace")[:300]
+            print(f"  [audio_cache] ffmpeg failed rc={result.returncode}: {err}")
+    except Exception as exc:
+        print(f"  [audio_cache] exception extracting WAV: {exc}")
+
+    return None
+
+
+def load_full_cached_audio(
+    video_path: str,
+    sr: int = 16000,
+) -> Tuple[Any, int]:
+    """
+    Load full audio for video_path as (y_full, sr) — exactly once per process.
+    Prefers cached WAV to avoid PySoundFile/audioread on mp4.
+    Returns (np.ndarray, sr) or (None, sr) if unavailable.
+    """
+    if not HAS_AUDIO:
+        return None, sr
+
+    video_str = str(video_path)
+    if video_str in _AUDIO_LOADED_CACHE:
+        return _AUDIO_LOADED_CACHE[video_str]
+
+    # Prefer WAV cache; fall back to direct path
+    wav_path = get_cached_audio_wav(video_str)
+    load_path = str(wav_path) if (wav_path and Path(wav_path).exists()) else video_str
+    audio_source = "cached_wav" if (wav_path and Path(wav_path).exists()) else "direct_mp4"
+
+    try:
+        y_full, loaded_sr = librosa.load(load_path, sr=sr, mono=True)
+        dur_s = len(y_full) / max(loaded_sr, 1)
+        print(f"  [audio_cache] audio_loaded_once: {len(y_full)} samples "
+              f"({dur_s:.1f}s) | source={audio_source}")
+        result = (y_full, loaded_sr)
+    except Exception as exc:
+        print(f"  [audio_cache] load failed ({audio_source}): {exc}")
+        result = (None, sr)
+
+    _AUDIO_LOADED_CACHE[video_str] = result
+    return result
 
 # LLM imports (опциональны)
 HAS_LLM = False
@@ -800,122 +902,110 @@ def compute_audio_energy(video_path: str, start_sec: float, end_sec: float) -> f
     """
     Вычисляет энергию аудио в сегменте (RMS amplitude).
     Возвращает нормированное значение 0-1.
+    Использует module-level cache: загружает полное аудио один раз на видео.
     """
     if not HAS_AUDIO:
         return 0.5
-    
+
     try:
-        # Загрузка аудио сегмента
-        y, sr = librosa.load(
-            video_path, 
-            sr=16000, 
-            offset=start_sec, 
-            duration=end_sec - start_sec
-        )
-        
-        # RMS energy
+        y_full, sr = load_full_cached_audio(video_path, sr=16000)
+        if y_full is None or len(y_full) == 0:
+            return 0.5
+
+        start_sample = int(start_sec * sr)
+        end_sample = int(end_sec * sr)
+        y = y_full[start_sample:end_sample]
+        if len(y) == 0:
+            return 0.5
+
         rms = librosa.feature.rms(y=y)[0]
         energy = float(np.mean(rms))
-        
-        # Нормализация 0-1 (RMS обычно 0-0.05, масштабируем x20)
         return min(energy * 20, 1.0)
-    except Exception as e:
-        # print(f"  WARNING: audio_energy failed: {e}")
-        return 0.5  # Fallback
+    except Exception:
+        return 0.5
 
 
 def compute_audio_features(
     video_path: str,
     start_sec: float,
     end_sec: float,
-    asr_segments: Optional[List[Dict]] = None
+    asr_segments: Optional[List[Dict]] = None,
 ) -> Dict[str, float]:
     """
-    Вычисляет все аудио фичи для окна (VIRAL режим).
-    
-    Возвращает:
-        - audio_energy: RMS amplitude (0-1)
-        - speech_rate: слов/сек, нормализованное (0-1)
-        - silence_ratio: доля тишины (0-1)
-        - pitch_variance: вариация высоты тона (0-1)
+    Вычисляет аудио-фичи для одного окна (VIRAL режим).
+
+    Оптимизация long-video: загружает полное аудио один раз на видео (module-level cache).
+    WAV-кэш через ffmpeg устраняет повторные PySoundFile/audioread предупреждения.
+
+    Возвращает: audio_energy, speech_rate, silence_ratio, pitch_variance
     """
-    # Fallback если нет librosa
+    _fallback = {
+        "audio_energy": 0.5,
+        "speech_rate": 0.5,
+        "silence_ratio": 0.5,
+        "pitch_variance": 0.5,
+        "_source": "fallback_no_audio",
+    }
+
     if not HAS_AUDIO:
-        return {
-            "audio_energy": 0.5,
-            "speech_rate": 0.5,
-            "silence_ratio": 0.5,
-            "pitch_variance": 0.5
-        }
-    
+        return _fallback
+
     try:
-        # Загрузка аудио
-        y, sr = librosa.load(
-            video_path,
-            sr=16000,
-            offset=start_sec,
-            duration=end_sec - start_sec
-        )
-        
+        # Load full audio once per video (cached in _AUDIO_LOADED_CACHE)
+        y_full, sr = load_full_cached_audio(video_path, sr=16000)
+        if y_full is None or len(y_full) == 0:
+            return {**_fallback, "_source": "fallback_load_failed"}
+
+        # Slice to window
+        start_sample = int(start_sec * sr)
+        end_sample = int(end_sec * sr)
+        y = y_full[start_sample:end_sample]
+        if len(y) == 0:
+            return {**_fallback, "_source": "fallback_empty_slice"}
+
         # 1. Audio energy (RMS)
         rms = librosa.feature.rms(y=y)[0]
         audio_energy = min(float(np.mean(rms)) * 20, 1.0)
-        
-        # 2. Speech rate (из ASR)
+
+        # 2. Speech rate (from ASR, no audio needed)
         speech_rate = 0.5
         if asr_segments:
             words_in_window = []
             for seg in asr_segments:
-                # Проверяем пересечение сегмента с окном
                 if seg["start"] < end_sec and seg["end"] > start_sec:
                     words_in_window.extend(seg["text"].split())
-            
             duration = end_sec - start_sec
             if duration > 0 and words_in_window:
-                words_per_sec = len(words_in_window) / duration
-                # Нормализация: 3 слова/сек = 1.0 (быстрая речь)
-                speech_rate = min(words_per_sec / 3.0, 1.0)
-        
+                speech_rate = min(len(words_in_window) / (duration * 3.0), 1.0)
+
         # 3. Silence ratio
-        # Считаем долю сэмплов с амплитудой < 0.01
-        silence_threshold = 0.01
-        silence_ratio = float(np.sum(np.abs(y) < silence_threshold) / max(len(y), 1))
-        
+        silence_ratio = float(np.sum(np.abs(y) < 0.01) / max(len(y), 1))
+
         # 4. Pitch variance
+        pitch_variance = 0.0
         try:
             pitches, magnitudes = librosa.piptrack(y=y, sr=sr, fmin=50, fmax=400)
-            # Извлекаем питчи с достаточной магнитудой
             pitch_values = []
             for t in range(pitches.shape[1]):
-                index = magnitudes[:, t].argmax()
-                pitch = pitches[index, t]
+                idx = magnitudes[:, t].argmax()
+                pitch = pitches[idx, t]
                 if pitch > 0:
                     pitch_values.append(pitch)
-            
             if len(pitch_values) > 1:
-                pitch_variance = float(np.std(pitch_values))
-                # Нормализация: стд 100 Гц = 1.0
-                pitch_variance = min(pitch_variance / 100, 1.0)
-            else:
-                pitch_variance = 0.0
+                pitch_variance = min(float(np.std(pitch_values)) / 100.0, 1.0)
         except Exception:
             pitch_variance = 0.0
-        
+
         return {
             "audio_energy": audio_energy,
             "speech_rate": speech_rate,
             "silence_ratio": silence_ratio,
-            "pitch_variance": pitch_variance
+            "pitch_variance": pitch_variance,
+            "_source": "cached_wav",
         }
-    
-    except Exception as e:
-        # Fallback значения при ошибке
-        return {
-            "audio_energy": 0.5,
-            "speech_rate": 0.5,
-            "silence_ratio": 0.5,
-            "pitch_variance": 0.5
-        }
+
+    except Exception:
+        return {**_fallback, "_source": "fallback_exception"}
 
 
 def create_sliding_windows(
