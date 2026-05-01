@@ -83,7 +83,8 @@ def _command_version(cmd: List[str]) -> str:
         return "unavailable"
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_file(path: Path) -> Optional[str]:
+    """Compute sha256 of a file using 8 MB chunks. Returns hex digest or None on error."""
     h = hashlib.sha256()
     try:
         with open(path, "rb") as f:
@@ -93,8 +94,9 @@ def _sha256_file(path: Path) -> str:
                     break
                 h.update(chunk)
         return h.hexdigest()
-    except Exception:
-        return "error"
+    except Exception as e:
+        logger.warning(f"[manifest] sha256 failed for {path}: {e}")
+        return None
 
 
 def _get_torch_info() -> Dict[str, Any]:
@@ -110,7 +112,8 @@ def _get_torch_info() -> Dict[str, Any]:
 
 
 def _now_iso() -> str:
-    return datetime.datetime.utcnow().isoformat() + "Z"
+    """Return current UTC time as ISO-8601 string with Z suffix (timezone-aware)."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _build_initial_manifest(
@@ -130,12 +133,14 @@ def _build_initial_manifest(
             size_mb = round(vp.stat().st_size / 1024 / 1024, 2)
         except Exception:
             size_mb = 0.0
+        logger.info(f"[manifest] Computing sha256 for {vp.name} ({size_mb:.1f} MB)...")
+        sha256 = _sha256_file(vp)
         video_entries.append({
             "filename": vp.name,
             "path": str(vp),
-            "sha256": None,   # filled lazily after YOLO
+            "sha256": sha256,
             "size_mb": size_mb,
-            "duration_sec": None,
+            "duration_sec": None,  # filled per-video in main loop
         })
     return {
         "run_id": output_dir.name,
