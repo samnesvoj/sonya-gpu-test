@@ -106,6 +106,32 @@ python benchmark_runner.py \
 | `none` | Ничего не экспортировать. |
 | `--skip-export` | Переопределяет любой `--export-policy`. Нет экспорта совсем. |
 
+### Экспорт top-K кандидатов на режим (`--export-top-k`)
+
+По умолчанию режим сохраняет один клип (первый в списке `candidates`).
+Чтобы сохранить **top-2** (или больше) для ручного просмотра:
+
+```bash
+python benchmark_runner.py \
+  --videos data/input \
+  --modes hook story viral educational trailer_preview \
+  --model yolov8n \
+  --whisper-model tiny \
+  --output outputs/full_drive_top2_review_split \
+  --strict-real \
+  --export-policy review-split \
+  --export-top-k 2
+```
+
+Имена файлов в `exports/`:
+
+```
+exports/<bucket>/<mode>/rank01_<run_id>.mp4
+exports/<bucket>/<mode>/rank02_<run_id>.mp4
+```
+
+В папке прогона: `output_rank01.mp4`, `output_rank02.mp4`, а `output.mp4` — копия rank01 для обратной совместимости.
+
 ### Пример review-split output tree:
 
 ```
@@ -113,16 +139,17 @@ outputs/prod_today/
   exports/
     auto/
       educational/
-        <run_id>.mp4        ← auto_export clip
+        rank01_<run_id>.mp4
+        rank02_<run_id>.mp4
     review/
       hook/
-        <run_id>.mp4        ← manual_review clip
+        rank01_<run_id>.mp4
       story/
-        <run_id>.mp4
+        rank01_<run_id>.mp4
       viral/
-        <run_id>.mp4
+        rank01_<run_id>.mp4
       trailer_preview/
-        <run_id>.mp4
+        rank01_<run_id>.mp4
 ```
 
 ---
@@ -132,7 +159,7 @@ outputs/prod_today/
 ```
 outputs/<run>/
   run_manifest.json               ← git commit, gpu, timing, export summary
-  exports_manifest.json           ← все экспортированные клипы по bucket
+  exports_manifest.json           ← все экспортированные mp4 (по файлам), duration_sec, rank
   summary.csv                     ← главная таблица + export_policy/bucket/path
   progress_report.txt             ← статус по уровням + export policy summary
   runtime_breakdown.csv           ← время по этапам
@@ -146,21 +173,21 @@ outputs/<run>/
 
   exports/                        ← aggregated clips по bucket
     auto/
-      <mode>/
-        <run_id>.mp4
+      <mode>/rankNN_<run_id>.mp4
     review/
-      <mode>/
-        <run_id>.mp4
+      <mode>/rankNN_<run_id>.mp4
 
   <video>__<mode>__<model>__<id>/
     candidates.json
     ranking.json
-    export_decision.json          ← decision + export_policy + bucket + path
+    export_decision.json          ← decision + exports[] + топ-K поля
     base_analysis.json            ← копия YOLO (для backward compat)
     pipeline_trace.json           ← diagnostics: base_analysis + audio_cache
     runtime_metrics.json          ← timing + export fields
     human_review_template.json    ← заполни вручную
-    output.mp4                    ← legacy copy клипа (если экспортировался)
+    output.mp4                    ← legacy: копия rank01 при успешном экспорте
+    output_rank01.mp4
+    output_rank02.mp4             ← при --export-top-k 2+
     error_traceback.txt           ← если реальный mode упал
 ```
 
@@ -178,6 +205,7 @@ outputs/<run>/
 | `--whisper-model` | `base` | tiny/base/small/medium/large |
 | `--strict-real` | выключено | Exit 1 если хоть один режим = stub |
 | `--export-policy` | `all` | all / auto-only / review-split / none |
+| `--export-top-k` | `1` | Сколько верхних кандидатов нарезать на режим (минимум 1). |
 | `--resume` | выключено | Переиспользовать shared/base_analysis + asr_segments |
 
 ---

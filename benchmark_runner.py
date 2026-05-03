@@ -1286,6 +1286,74 @@ MODE_RUNNERS = {
 # Экспорт клипа
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _candidate_time_bounds(cand: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    """Return (start_sec, end_sec) from candidate fields, or None if unusable."""
+    if not isinstance(cand, dict):
+        return None
+    rs, re_ = cand.get("refined_start_sec"), cand.get("refined_end_sec")
+    if rs is not None and re_ is not None:
+        try:
+            s, e = float(rs), float(re_)
+        except (TypeError, ValueError):
+            return None
+    else:
+        ss, es = cand.get("start_sec"), cand.get("end_sec")
+        if ss is not None and es is not None:
+            try:
+                s, e = float(ss), float(es)
+            except (TypeError, ValueError):
+                return None
+        else:
+            st, en = cand.get("start"), cand.get("end")
+            if st is None or en is None:
+                return None
+            try:
+                s, e = float(st), float(en)
+            except (TypeError, ValueError):
+                return None
+    if e <= s:
+        return None
+    return s, e
+
+
+def _candidate_duration_from_fields(cand: Dict[str, Any]) -> Optional[float]:
+    b = _candidate_time_bounds(cand)
+    if b is None:
+        return None
+    return round(b[1] - b[0], 3)
+
+
+def _duration_from_exported_mp4(path: Path) -> Optional[float]:
+    if not path.exists():
+        return None
+    meta = _ffprobe_metadata(path)
+    d = float(meta.get("duration_sec") or 0.0)
+    if d > 0:
+        return round(d, 3)
+    return None
+
+
+def _resolve_export_duration_sec(cand: Dict[str, Any], exported_path: Optional[Path]) -> Optional[float]:
+    """Duration for manifest: candidate fields first, then ffprobe on exported file."""
+    d = _candidate_duration_from_fields(cand)
+    if d is not None and d > 0:
+        return d
+    if exported_path is not None:
+        return _duration_from_exported_mp4(exported_path)
+    return None
+
+
+def _candidate_score(cand: Dict[str, Any]) -> Optional[float]:
+    if not isinstance(cand, dict):
+        return None
+    if cand.get("score") is not None:
+        try:
+            return float(cand["score"])
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
 def export_clip(
     video_path: Path,
     start_sec: float,
@@ -1880,6 +1948,7 @@ def run_single(
     mode_results_cache: Optional[Dict] = None,
     skip_export: bool = False,
     export_policy: str = "all",
+    export_top_k: int = 1,
 ) -> Dict[str, Any]:
     """
     Прогоняет одно видео через один режим.
@@ -2061,26 +2130,102 @@ def run_single(
             _save_json(run_dir / "duration_trimmed.json", _raw_out["duration_trimmed"])
 
     # ── 4. Экспорт клипа ──────────────────────────────────────────────────────
-    export_bucket = _resolve_export_bucket(export_decision, export_policy, skip_export)
+    top1_score = top1.get("score", None) if top1 else None
 
-    if export_bucket is not None and top1 and candidates:
-        start = top1.get("start_sec", 0.0)
-        end = top1.get("end_sec", start + 10.0)
-        clip_exported, export_sec = export_clip(video_path, start, end, output_mp4)
-        if clip_exported:
-            legacy_output_path = str(output_mp4)
+    export_bucket = _resolve_export_bucket(export_decision, export_policy, skip_export)
+    export_top_k_effective = max(1, int(export_top_k))
+
+    exported_clips_count = 0
+    exports_detail: List[Dict[str, Any]] = []
+    export_manifest_items: List[Dict[str, Any]] = []
+    export_paths_list: List[str] = []
+
+    if export_bucket is not None and candidates:
+        _slice = candidates[:export_top_k_effective]
+        _bucket_parent = output_dir / "exports" / export_bucket / mode
+
+        for rank_idx, cand in enumerate(_slice, start=1):
+            rank_label = f"{rank_idx:02d}"
+            cand_score = _candidate_score(cand)
+            row_base: Dict[str, Any] = {
+                "rank": rank_idx,
+                "bucket": export_bucket,
+                "path": None,
+                "legacy_output_path": None,
+                "start_sec": None,
+                "end_sec": None,
+                "duration_sec": None,
+                "export_error": None,
+            }
+
+            bounds = _candidate_time_bounds(cand)
+            if bounds is None:
+                row_base["export_error"] = "invalid_or_missing_time_bounds"
+                exports_detail.append(row_base)
+                continue
+
+            start, end = bounds
+            row_base["start_sec"] = round(start, 3)
+            row_base["end_sec"] = round(end, 3)
+
+            legacy_rank_path = run_dir / f"output_rank{rank_label}.mp4"
+            ok_part, elapsed_part = export_clip(video_path, start, end, legacy_rank_path)
+            export_sec += elapsed_part
+
+            if not ok_part:
+                row_base["export_error"] = "ffmpeg_export_failed"
+                exports_detail.append(row_base)
+                continue
+
+            dur = _resolve_export_duration_sec(cand, legacy_rank_path)
+            row_base["duration_sec"] = dur
+
+            bucket_dest = _bucket_parent / f"rank{rank_label}_{run_id}.mp4"
             try:
-                _bucket_dir = output_dir / "exports" / export_bucket / mode
-                _bucket_dir.mkdir(parents=True, exist_ok=True)
-                _bucket_dest = _bucket_dir / f"{run_id}.mp4"
-                shutil.copy2(output_mp4, _bucket_dest)
-                export_path = str(_bucket_dest)
+                _bucket_parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(legacy_rank_path, bucket_dest)
+                path_str = str(bucket_dest)
             except Exception as _copy_exc:
-                export_error = str(_copy_exc)
-                logger.warning(f"[export] copy to bucket failed: {_copy_exc}")
-                export_path = None
-        else:
-            export_sec = 0.0
+                row_base["export_error"] = f"bucket_copy_failed: {_copy_exc}"
+                exports_detail.append(row_base)
+                continue
+
+            exported_clips_count += 1
+            row_base["path"] = path_str
+            row_base["legacy_output_path"] = str(legacy_rank_path)
+            export_paths_list.append(path_str)
+            exports_detail.append(row_base)
+
+            export_manifest_items.append({
+                "run_id": run_id,
+                "video": video_path.name,
+                "mode": mode,
+                "export_decision": export_decision,
+                "bucket": export_bucket,
+                "rank": rank_idx,
+                "path": path_str,
+                "legacy_output_path": str(legacy_rank_path),
+                "start_sec": row_base["start_sec"],
+                "end_sec": row_base["end_sec"],
+                "duration_sec": dur,
+                "top1_score": top1_score,
+                "candidate_score": cand_score,
+            })
+
+            if rank_idx == 1:
+                export_path = path_str
+                try:
+                    shutil.copy2(legacy_rank_path, output_mp4)
+                    legacy_output_path = str(output_mp4)
+                except Exception as _syn_exc:
+                    export_error = str(_syn_exc)
+                    logger.warning(f"[export] output.mp4 copy failed: {_syn_exc}")
+
+    clip_exported = exported_clips_count > 0
+    export_paths_str = ";".join(export_paths_list)
+
+    if export_bucket is not None and candidates and exported_clips_count == 0:
+        export_error = export_error or "no_clips_exported"
 
     _save_json(run_dir / "export_decision.json", {
         "decision": export_decision,
@@ -2089,6 +2234,10 @@ def run_single(
         "export_path": export_path,
         "legacy_output_path": legacy_output_path,
         "clip_exported": clip_exported,
+        "export_top_k": export_top_k_effective,
+        "exported_clips_count": exported_clips_count,
+        "export_paths": export_paths_str,
+        "exports": exports_detail,
         "export_error": export_error,
     })
 
@@ -2098,7 +2247,6 @@ def run_single(
     runtime_total_sec = round(t_total_end - t_total_start, 2)
 
     # ── 5. Runtime metrics ────────────────────────────────────────────────────
-    top1_score = top1.get("score", None) if top1 else None
     num_candidates = len(candidates)
 
     adapter_error = mode_result.get("adapter_error")
@@ -2132,6 +2280,9 @@ def run_single(
         "export_policy": export_policy,
         "export_bucket": export_bucket,
         "export_path": export_path,
+        "export_top_k": export_top_k_effective,
+        "exported_clips_count": exported_clips_count,
+        "export_paths": export_paths_str,
         # Debug-сигналы фильтрации
         "raw_proposals_count": raw_proposals_count,
         "rejected_count": rejected_count,
@@ -2206,6 +2357,10 @@ def run_single(
         "export_policy": export_policy,
         "export_bucket": export_bucket,
         "export_path": export_path,
+        "export_top_k": export_top_k_effective,
+        "exported_clips_count": exported_clips_count,
+        "export_paths": export_paths_str,
+        "exports_manifest_items": export_manifest_items,
         "raw_proposals_count": raw_proposals_count,
         "rejected_count": rejected_count,
         "main_reject_reason": main_reject_reason,
@@ -2246,12 +2401,23 @@ def save_summary_csv(rows: List[Dict], output_dir: Path) -> Path:
     if not rows:
         return output_dir / "summary.csv"
 
-    fieldnames = list(rows[0].keys())
+    fieldnames: List[str] = []
+    seen = set()
+    _skip_cols = frozenset({"exports_manifest_items"})
+    for r in rows:
+        for k in r:
+            if k in _skip_cols:
+                continue
+            if k not in seen:
+                seen.add(k)
+                fieldnames.append(k)
     path = output_dir / "summary.csv"
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(
+            [{k: v for k, v in r.items() if k not in _skip_cols} for r in rows]
+        )
     return path
 
 
@@ -2367,21 +2533,25 @@ def save_progress_report(
         lines.append("")
 
     # ── Export policy summary ─────────────────────────────────────────────────
-    _total_exported = sum(1 for r in rows if r.get("clip_exported"))
-    _by_bucket: Dict[str, int] = {}
+    _runs_with_export = sum(1 for r in rows if r.get("clip_exported"))
+    _total_clip_files = sum(int(r.get("exported_clips_count") or 0) for r in rows)
+    _by_bucket_files: Dict[str, int] = {}
     for _r in rows:
-        if _r.get("clip_exported") and _r.get("export_bucket"):
-            _bk = _r["export_bucket"]
-            _by_bucket[_bk] = _by_bucket.get(_bk, 0) + 1
+        _bk = _r.get("export_bucket")
+        if _bk:
+            nc = int(_r.get("exported_clips_count") or 0)
+            if nc > 0:
+                _by_bucket_files[_bk] = _by_bucket_files.get(_bk, 0) + nc
 
     lines += ["─" * 70, "EXPORT POLICY", ""]
     if skip_export:
         lines.append("  skip_export: true")
-        lines.append("  exported total: 0")
+        lines.append("  exported clip files: 0")
     else:
         lines.append(f"  policy: {export_policy}")
-        lines.append(f"  exported total: {_total_exported}")
-        for _bkt, _cnt in sorted(_by_bucket.items()):
+        lines.append(f"  exported runs (modes with ≥1 clip): {_runs_with_export}")
+        lines.append(f"  exported clip files total: {_total_clip_files}")
+        for _bkt, _cnt in sorted(_by_bucket_files.items()):
             lines.append(f"  {_bkt}: {_cnt}")
     lines.append("")
 
@@ -2448,7 +2618,17 @@ def main() -> None:
                             "none=no export. "
                             "--skip-export overrides this."
                         ))
+    parser.add_argument(
+        "--export-top-k",
+        type=int,
+        default=1,
+        help="Export top K candidates per mode run (default 1). Minimum 1.",
+    )
     args = parser.parse_args()
+
+    if getattr(args, "export_top_k", 1) < 1:
+        logger.warning("--export-top-k must be >= 1, using 1")
+        args.export_top_k = 1
 
     videos_dir = Path(args.videos)
     output_dir = Path(args.output)
@@ -2489,6 +2669,7 @@ def main() -> None:
 
     logger.info(f"  Export policy: {export_policy} | skip_export={_effective_skip} | "
                 f"effective={_effective_export_policy}")
+    logger.info(f"  Export top-k: {int(getattr(args, 'export_top_k', 1))}")
 
     # ── run_manifest.json: initial write ─────────────────────────────────────
     manifest = _build_initial_manifest(
@@ -2502,6 +2683,7 @@ def main() -> None:
     )
     manifest["export_policy"] = export_policy
     manifest["effective_export_policy"] = _effective_export_policy
+    manifest["export_top_k"] = int(getattr(args, "export_top_k", 1))
     _save_json(output_dir / "run_manifest.json", manifest)
 
     try:
@@ -2595,6 +2777,7 @@ def main() -> None:
                             mode_results_cache=mode_results_cache,
                             skip_export=_effective_skip,
                             export_policy=_effective_export_policy,
+                            export_top_k=int(getattr(args, "export_top_k", 1)),
                         )
                         all_rows.append(row)
                     except Exception as e:
@@ -2618,6 +2801,13 @@ def main() -> None:
                             "top1_score": None,
                             "export_decision": "error",
                             "clip_exported": False,
+                            "export_policy": _effective_export_policy,
+                            "export_bucket": None,
+                            "export_path": None,
+                            "export_top_k": int(getattr(args, "export_top_k", 1)),
+                            "exported_clips_count": 0,
+                            "export_paths": "",
+                            "exports_manifest_items": [],
                             "maturity_level": 0,
                             "output_dir": str(output_dir),
                         })
@@ -2635,29 +2825,21 @@ def main() -> None:
                     _save_json(shared_dir / "audio_cache_manifest.json", {"enabled": False, "items": []})
 
         # ── exports_manifest.json ─────────────────────────────────────────────
-        _exported_rows = [r for r in all_rows if r.get("clip_exported")]
+        _exports_items: List[Dict[str, Any]] = []
+        for _r in all_rows:
+            _exports_items.extend(_r.get("exports_manifest_items") or [])
+
         _by_bucket: Dict[str, int] = {}
-        _exports_items = []
-        for _er in _exported_rows:
-            _bkt = _er.get("export_bucket") or "all"
+        for _it in _exports_items:
+            _bkt = str(_it.get("bucket") or "all")
             _by_bucket[_bkt] = _by_bucket.get(_bkt, 0) + 1
-            _exports_items.append({
-                "run_id": _er.get("run_id", ""),
-                "video": _er.get("video", ""),
-                "mode": _er.get("mode", ""),
-                "export_decision": _er.get("export_decision", ""),
-                "bucket": _bkt,
-                "path": _er.get("export_path"),
-                "legacy_output_path": str(Path(_er.get("output_dir", "")) / "output.mp4")
-                    if _er.get("output_dir") else None,
-                "duration_sec": None,   # populated from top1 if available
-                "top1_score": _er.get("top1_score"),
-            })
+
         _exports_manifest = {
             "export_policy": export_policy,
             "effective_export_policy": _effective_export_policy,
+            "export_top_k": int(getattr(args, "export_top_k", 1)),
             "skip_export": _effective_skip,
-            "total_exported": len(_exported_rows),
+            "total_exported": len(_exports_items),
             "by_bucket": _by_bucket,
             "items": _exports_items,
         }
@@ -2666,7 +2848,7 @@ def main() -> None:
         # ── run_manifest: update summary on success ───────────────────────────
         stub_count = sum(1 for r in all_rows if r.get("stub"))
         error_count = sum(1 for r in all_rows if r.get("export_decision") == "error")
-        exported_count = len(_exported_rows)
+        exported_count = len(_exports_items)
         manifest["finished_at"] = _now_iso()
         manifest["status"] = "success"
         manifest["exports"] = {
@@ -2693,6 +2875,8 @@ def main() -> None:
         try:
             _save_json(output_dir / "exports_manifest.json", {
                 "export_policy": export_policy,
+                "effective_export_policy": _effective_export_policy,
+                "export_top_k": int(getattr(args, "export_top_k", 1)),
                 "skip_export": _effective_skip,
                 "total_exported": 0,
                 "by_bucket": {},
