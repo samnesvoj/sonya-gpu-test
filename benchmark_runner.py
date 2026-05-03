@@ -1893,6 +1893,15 @@ def run_single(
     run_dir = output_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # Export state (initialized before any branch — avoids UnboundLocalError)
+    output_mp4 = run_dir / "output.mp4"
+    export_sec = 0.0
+    clip_exported = False
+    export_bucket: Optional[str] = None
+    export_path: Optional[str] = None
+    legacy_output_path: Optional[str] = None
+    export_error: Optional[str] = None
+
     logger.info(f"▶ Старт: {run_id}")
     t_total_start = time.perf_counter()
 
@@ -1951,15 +1960,6 @@ def run_single(
 
     _save_json(run_dir / "candidates.json", candidates)
     _save_json(run_dir / "ranking.json", ranking)
-    _save_json(run_dir / "export_decision.json", {
-        "decision": export_decision,
-        "export_policy": export_policy,
-        "export_bucket": export_bucket,
-        "export_path": export_path,
-        "legacy_output_path": str(output_mp4) if clip_exported else None,
-        "clip_exported": clip_exported,
-        "export_error": export_error,
-    })
     _save_json(run_dir / "boundary_diagnostics.json", boundary_diag)
 
     # ── Debug artifacts ───────────────────────────────────────────────────────
@@ -2061,25 +2061,16 @@ def run_single(
             _save_json(run_dir / "duration_trimmed.json", _raw_out["duration_trimmed"])
 
     # ── 4. Экспорт клипа ──────────────────────────────────────────────────────
-    export_sec = 0.0
-    output_mp4 = run_dir / "output.mp4"
-    clip_exported = False
-    export_bucket: Optional[str] = None
-    export_path: Optional[str] = None
-    export_error: Optional[str] = None
+    export_bucket = _resolve_export_bucket(export_decision, export_policy, skip_export)
 
-    _bucket = _resolve_export_bucket(export_decision, export_policy, skip_export)
-
-    if _bucket is not None and top1 and candidates:
+    if export_bucket is not None and top1 and candidates:
         start = top1.get("start_sec", 0.0)
         end = top1.get("end_sec", start + 10.0)
-        # Export to mode run dir (legacy path, always)
         clip_exported, export_sec = export_clip(video_path, start, end, output_mp4)
         if clip_exported:
-            export_bucket = _bucket
-            # Copy to exports/<bucket>/<mode>/<run_id>.mp4
+            legacy_output_path = str(output_mp4)
             try:
-                _bucket_dir = output_dir / "exports" / _bucket / mode
+                _bucket_dir = output_dir / "exports" / export_bucket / mode
                 _bucket_dir.mkdir(parents=True, exist_ok=True)
                 _bucket_dest = _bucket_dir / f"{run_id}.mp4"
                 shutil.copy2(output_mp4, _bucket_dest)
@@ -2087,15 +2078,16 @@ def run_single(
             except Exception as _copy_exc:
                 export_error = str(_copy_exc)
                 logger.warning(f"[export] copy to bucket failed: {_copy_exc}")
-                export_path = str(output_mp4)  # fallback to legacy path
+                export_path = None
+        else:
+            export_sec = 0.0
 
-    # Overwrite export_decision.json with real post-export values
     _save_json(run_dir / "export_decision.json", {
         "decision": export_decision,
         "export_policy": export_policy,
         "export_bucket": export_bucket,
         "export_path": export_path,
-        "legacy_output_path": str(output_mp4) if clip_exported else None,
+        "legacy_output_path": legacy_output_path,
         "clip_exported": clip_exported,
         "export_error": export_error,
     })
