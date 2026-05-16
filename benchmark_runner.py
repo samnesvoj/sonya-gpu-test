@@ -1474,20 +1474,30 @@ def _filter_promo_candidates(
     non_content_segments: List[Dict[str, Any]],
     mode: str,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Filter candidates through promo safety. Returns (safe_candidates, audit)."""
+    """
+    Non-destructive promo advisory filter.
+
+    Always returns a non-empty candidates_for_export when original candidates
+    are non-empty.  If safe candidates exist, returns them; otherwise falls
+    back to the original list (export is never cancelled by this filter).
+    """
+    _no_segs_audit = {
+        "policy": "promo_avoidance_generation_v1",
+        "promo_filter_mode": "non_destructive",
+        "mode": mode,
+        "original_candidates_count": len(candidates),
+        "safe_candidates_count": len(candidates),
+        "flagged_candidates_count": 0,
+        "flagged": [],
+        "non_content_segments_count": 0,
+        "all_candidates_flagged": False,
+        "fallback_to_original_candidates": False,
+    }
     if not non_content_segments:
-        return candidates, {
-            "policy": "promo_avoidance_generation_v1",
-            "mode": mode,
-            "original_candidates_count": len(candidates),
-            "safe_candidates_count": len(candidates),
-            "blocked_candidates_count": 0,
-            "blocked": [],
-            "non_content_segments_count": 0,
-        }
+        return candidates, _no_segs_audit
 
     safe: List[Dict[str, Any]] = []
-    blocked_audit: List[Dict[str, Any]] = []
+    flagged_audit: List[Dict[str, Any]] = []
 
     for orig_idx, cand in enumerate(candidates):
         is_safe, overlap_audit = _apply_promo_candidate_safety(cand, non_content_segments, mode)
@@ -1501,18 +1511,33 @@ def _filter_promo_candidates(
                 "end_sec": round(bounds[1], 3) if bounds else None,
                 **overlap_audit,
             }
-            blocked_audit.append(entry)
+            flagged_audit.append(entry)
+
+    all_flagged = len(safe) == 0 and len(candidates) > 0
+    # Non-destructive fallback: if everything was flagged, keep original list
+    candidates_for_export = candidates if all_flagged else safe
 
     audit: Dict[str, Any] = {
         "policy": "promo_avoidance_generation_v1",
+        "promo_filter_mode": "non_destructive",
         "mode": mode,
         "original_candidates_count": len(candidates),
         "safe_candidates_count": len(safe),
-        "blocked_candidates_count": len(blocked_audit),
-        "blocked": blocked_audit,
+        "flagged_candidates_count": len(flagged_audit),
+        "flagged": flagged_audit,
         "non_content_segments_count": len(non_content_segments),
+        "all_candidates_flagged": all_flagged,
+        "fallback_to_original_candidates": all_flagged,
     }
-    return safe, audit
+    if all_flagged:
+        logger.warning(
+            "[promo_filter] All %d candidates flagged for %s/%s — "
+            "falling back to original candidates (non-destructive)",
+            len(candidates), mode, "",
+        )
+        audit["reason"] = "all_candidates_flagged_export_preserved"
+
+    return candidates_for_export, audit
 
 
 def _intervals_overlap_info(
@@ -2561,27 +2586,27 @@ def run_single(
     original_top1_score = top1.get("score", None) if top1 else None
     top1_score = original_top1_score
 
-    # ── Promo / non-content candidate safety filter ───────────────────────────
+    # ── Promo / non-content advisory filter (non-destructive) ────────────────
     _nc_segs: List[Dict] = non_content_segments or []
     candidates_for_export, _promo_safety_audit = _filter_promo_candidates(
         candidates, _nc_segs, mode
     )
     _save_json(run_dir / "candidate_safety_audit.json", _promo_safety_audit)
 
-    # Update top1_score to first safe candidate if filtering changed the pool
+    _promo_all_flagged = _promo_safety_audit.get("all_candidates_flagged", False)
+    _promo_fallback = _promo_safety_audit.get("fallback_to_original_candidates", False)
+
+    # top1_score: use first candidate in the (possibly filtered) export pool
     _safe_top1_score: Optional[float] = None
     if candidates_for_export:
-        _safe_top1_score = candidates_for_export[0].get("score", None)
-        if _safe_top1_score is not None:
-            try:
-                _safe_top1_score = float(_safe_top1_score)
-            except (TypeError, ValueError):
-                _safe_top1_score = None
+        _raw_s = candidates_for_export[0].get("score", None)
+        try:
+            _safe_top1_score = float(_raw_s) if _raw_s is not None else None
+        except (TypeError, ValueError):
+            _safe_top1_score = None
     _promo_filter_changed_top1 = (_safe_top1_score != original_top1_score)
     if candidates_for_export:
         top1_score = _safe_top1_score
-
-    _promo_all_blocked = (len(candidates_for_export) == 0 and len(candidates) > 0)
 
     export_bucket = _resolve_export_bucket(export_decision, export_policy, skip_export)
     export_top_k_effective = max(1, int(export_top_k))
@@ -2599,14 +2624,9 @@ def run_single(
         "rejected": [],
     }
 
-    if _promo_all_blocked:
-        export_error = "no_safe_candidates_after_promo_filter"
-        logger.warning(
-            "[promo_filter] All %d candidates blocked for %s/%s; skipping export",
-            len(candidates), video_path.name, mode,
-        )
-
-    if export_bucket is not None and candidates_for_export and not _promo_all_blocked:
+    # candidates_for_export is always non-empty when candidates were present
+    # (non-destructive fallback ensures this)
+    if export_bucket is not None and candidates_for_export:
         _diverse_selected, _export_selection_audit = _select_diverse_export_candidates(
             candidates_for_export, export_top_k_effective, mode
         )
@@ -2721,12 +2741,18 @@ def run_single(
         "original_top1_score": original_top1_score,
         "safe_top1_score": _safe_top1_score,
         "promo_filter_changed_top1": _promo_filter_changed_top1,
+        "promo_filter_mode": "non_destructive",
+        "all_candidates_flagged": _promo_all_flagged,
+        "fallback_to_original_candidates": _promo_fallback,
         "promo_safety": {
             "policy": "promo_avoidance_generation_v1",
+            "promo_filter_mode": "non_destructive",
             "original_candidates_count": _promo_safety_audit["original_candidates_count"],
             "safe_candidates_count": _promo_safety_audit["safe_candidates_count"],
-            "blocked_candidates_count": _promo_safety_audit["blocked_candidates_count"],
+            "flagged_candidates_count": _promo_safety_audit.get("flagged_candidates_count", 0),
             "non_content_segments_count": _promo_safety_audit.get("non_content_segments_count", 0),
+            "all_candidates_flagged": _promo_all_flagged,
+            "fallback_to_original_candidates": _promo_fallback,
             "used_for_export_selection": True,
         },
     })
@@ -2779,8 +2805,10 @@ def run_single(
         "main_reject_reason": main_reject_reason,
         "had_raw_signal": had_raw_signal,
         # Promo safety counts (simple, kept out of large audit dicts)
-        "promo_blocked_candidates_count": _promo_safety_audit.get("blocked_candidates_count", 0),
+        "promo_blocked_candidates_count": _promo_safety_audit.get("flagged_candidates_count", 0),
         "promo_safe_candidates_count": _promo_safety_audit.get("safe_candidates_count", len(candidates)),
+        "promo_all_candidates_flagged": _promo_all_flagged,
+        "promo_fallback_to_original_candidates": _promo_fallback,
         # Режим-специфичные метрики
         **mode_metrics,
         # Русские лейблы (для удобства чтения)
