@@ -108,6 +108,12 @@ python benchmark_runner.py \
 
 ### Экспорт top-K кандидатов на режим (`--export-top-k`)
 
+> **Temporal diverse selection:** `--export-top-k` now uses temporal diversity.
+> rank02 is exported only if it differs sufficiently in time from rank01
+> (per-mode thresholds: gap ≥ 20–45 s, overlap ratio ≤ 0.20–0.30).
+> If no sufficiently different rank02 exists, only rank01 is exported.
+> Audit details are saved in each run's `export_decision.json → export_selection_audit`.
+
 По умолчанию режим сохраняет один клип (первый в списке `candidates`).
 Чтобы сохранить **top-2** (или больше) для ручного просмотра:
 

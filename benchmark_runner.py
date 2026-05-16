@@ -1354,6 +1354,129 @@ def _candidate_score(cand: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Temporal-diverse export selection
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DIVERSITY_THRESHOLDS: Dict[str, Dict[str, float]] = {
+    "hook":            {"max_overlap_ratio": 0.20, "min_gap_sec": 20.0},
+    "viral":           {"max_overlap_ratio": 0.25, "min_gap_sec": 30.0},
+    "educational":     {"max_overlap_ratio": 0.25, "min_gap_sec": 30.0},
+    "story":           {"max_overlap_ratio": 0.20, "min_gap_sec": 45.0},
+    "trailer_preview": {"max_overlap_ratio": 0.30, "min_gap_sec": 30.0},
+}
+_DIVERSITY_DEFAULT: Dict[str, float] = {"max_overlap_ratio": 0.25, "min_gap_sec": 30.0}
+
+
+def _intervals_overlap_info(
+    start_a: float, end_a: float,
+    start_b: float, end_b: float,
+) -> Tuple[float, float]:
+    """Return (overlap_ratio, gap_sec) for two time intervals.
+
+    overlap_ratio = overlap_sec / min(dur_a, dur_b)
+    gap_sec = 0 if intervals overlap, else distance between them.
+    """
+    dur_a = end_a - start_a
+    dur_b = end_b - start_b
+    if dur_a <= 0 or dur_b <= 0:
+        return 1.0, 0.0  # treat degenerate interval as fully overlapping
+    overlap_sec = max(0.0, min(end_a, end_b) - max(start_a, start_b))
+    min_dur = min(dur_a, dur_b)
+    overlap_ratio = overlap_sec / min_dur if min_dur > 0 else 0.0
+    if overlap_sec > 0:
+        gap_sec = 0.0
+    else:
+        gap_sec = max(start_a, start_b) - min(end_a, end_b)
+    return round(overlap_ratio, 4), round(max(0.0, gap_sec), 2)
+
+
+def _select_diverse_export_candidates(
+    candidates: List[Dict[str, Any]],
+    export_top_k: int,
+    mode: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Select up to export_top_k candidates with temporal diversity.
+
+    Candidates are considered in the order they arrive (score-ranked by
+    the caller).  rank01 is always the first candidate.  Subsequent ranks
+    are skipped if they overlap too much or are too close to any already-
+    selected candidate.
+
+    Returns (selected_candidates, audit_dict).
+    """
+    thresholds = _DIVERSITY_THRESHOLDS.get(mode, _DIVERSITY_DEFAULT)
+    max_overlap_ratio: float = thresholds["max_overlap_ratio"]
+    min_gap_sec: float = thresholds["min_gap_sec"]
+
+    selected: List[Dict[str, Any]] = []
+    selected_bounds: List[Optional[Tuple[float, float]]] = []
+    selected_indices: List[int] = []
+    rejected: List[Dict[str, Any]] = []
+
+    for orig_idx, cand in enumerate(candidates):
+        if len(selected) >= export_top_k:
+            break
+
+        bounds = _candidate_time_bounds(cand)
+
+        if bounds is None:
+            if len(selected) == 0:
+                # rank01: accept even without valid bounds (nothing to compare)
+                selected.append(cand)
+                selected_indices.append(orig_idx)
+                selected_bounds.append(None)
+            else:
+                rejected.append({
+                    "original_index": orig_idx,
+                    "reason": "missing_time_bounds",
+                })
+            continue
+
+        start_b, end_b = bounds
+        reject_entry: Optional[Dict[str, Any]] = None
+
+        for sel_idx, sel_b in enumerate(selected_bounds):
+            if sel_b is None:
+                continue  # can't compare when selected has no bounds
+            start_a, end_a = sel_b
+            overlap_ratio, gap_sec = _intervals_overlap_info(
+                start_a, end_a, start_b, end_b
+            )
+            if overlap_ratio > max_overlap_ratio:
+                reject_entry = {
+                    "original_index": orig_idx,
+                    "reason": "overlap_with_selected",
+                    "overlap_ratio": overlap_ratio,
+                    "selected_original_index": selected_indices[sel_idx],
+                }
+                break
+            if gap_sec < min_gap_sec:
+                reject_entry = {
+                    "original_index": orig_idx,
+                    "reason": "too_close_to_selected",
+                    "gap_sec": gap_sec,
+                    "selected_original_index": selected_indices[sel_idx],
+                }
+                break
+
+        if reject_entry is None:
+            selected.append(cand)
+            selected_indices.append(orig_idx)
+            selected_bounds.append((start_b, end_b))
+        else:
+            rejected.append(reject_entry)
+
+    audit: Dict[str, Any] = {
+        "policy": "temporal_diverse_v1",
+        "mode": mode,
+        "requested_top_k": export_top_k,
+        "selected_original_indices": selected_indices,
+        "rejected": rejected,
+    }
+    return selected, audit
+
+
 def export_clip(
     video_path: Path,
     start_sec: float,
@@ -2140,11 +2263,21 @@ def run_single(
     export_manifest_items: List[Dict[str, Any]] = []
     export_paths_list: List[str] = []
 
+    _export_selection_audit: Dict[str, Any] = {
+        "policy": "temporal_diverse_v1",
+        "mode": mode,
+        "requested_top_k": export_top_k_effective,
+        "selected_original_indices": [],
+        "rejected": [],
+    }
+
     if export_bucket is not None and candidates:
-        _slice = candidates[:export_top_k_effective]
+        _diverse_selected, _export_selection_audit = _select_diverse_export_candidates(
+            candidates, export_top_k_effective, mode
+        )
         _bucket_parent = output_dir / "exports" / export_bucket / mode
 
-        for rank_idx, cand in enumerate(_slice, start=1):
+        for rank_idx, cand in enumerate(_diverse_selected, start=1):
             rank_label = f"{rank_idx:02d}"
             cand_score = _candidate_score(cand)
             row_base: Dict[str, Any] = {
@@ -2239,6 +2372,10 @@ def run_single(
         "export_paths": export_paths_str,
         "exports": exports_detail,
         "export_error": export_error,
+        "export_selection_policy": "temporal_diverse_v1",
+        "export_requested_top_k": export_top_k_effective,
+        "export_selected_count": exported_clips_count,
+        "export_selection_audit": _export_selection_audit,
     })
 
     vram_peak = max(_vram_used_mb(), vram_after_yolo) - vram_before
