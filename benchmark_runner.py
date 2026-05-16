@@ -2605,6 +2605,18 @@ def main() -> None:
     parser.add_argument("--whisper-model", default="base",
                         choices=["tiny", "base", "small", "medium", "large"],
                         help="Размер Whisper: tiny/base = быстро, small/medium = качественнее")
+    parser.add_argument("--asr-engine", default="openai-whisper",
+                        choices=["openai-whisper", "faster-whisper"],
+                        help="ASR backend (default: openai-whisper, legacy behavior)")
+    parser.add_argument("--asr-word-timestamps", action="store_true",
+                        help="Request word-level timestamps (faster-whisper)")
+    parser.add_argument("--asr-vad", action="store_true",
+                        help="Enable VAD filter (faster-whisper)")
+    parser.add_argument("--asr-compute-type", default="float16",
+                        choices=["float16", "int8_float16", "int8"],
+                        help="faster-whisper compute type")
+    parser.add_argument("--asr-batch-size", type=int, default=8,
+                        help="faster-whisper batch size")
     parser.add_argument("--resume", action="store_true",
                         help="Resume: reuse cached shared/base_analysis.json and shared/asr_segments.json "
                              "from the same output dir (skip YOLO/ASR if cached)")
@@ -2684,6 +2696,9 @@ def main() -> None:
     manifest["export_policy"] = export_policy
     manifest["effective_export_policy"] = _effective_export_policy
     manifest["export_top_k"] = int(getattr(args, "export_top_k", 1))
+    manifest["asr_engine"] = getattr(args, "asr_engine", "openai-whisper")
+    manifest["asr_word_timestamps"] = bool(getattr(args, "asr_word_timestamps", False))
+    manifest["asr_vad"] = bool(getattr(args, "asr_vad", False))
     _save_json(output_dir / "run_manifest.json", manifest)
 
     try:
@@ -2737,30 +2752,101 @@ def main() -> None:
 
                 # ── ASR: resume or compute ────────────────────────────────
                 pre_asr_segments: List[Dict] = []
-                _shared_asr = shared_dir / "asr_segments.json"
                 needs_asr = any(m in args.modes for m in ("hook", "story", "educational", "trailer_preview"))
+                _asr_v2_result = None
 
-                if _resume and _shared_asr.exists() and needs_asr:
-                    try:
-                        with open(_shared_asr, encoding="utf-8") as _f:
-                            _loaded_asr = json.load(_f)
-                        if isinstance(_loaded_asr, list):
-                            pre_asr_segments = _loaded_asr
-                            logger.info(f"Resume: using cached shared/asr_segments.json "
-                                        f"({len(pre_asr_segments)} segments)")
-                        else:
-                            raise ValueError("not a list")
-                    except Exception as _e:
-                        logger.warning(f"Resume asr_segments invalid ({_e}), recalculating")
-                        pre_asr_segments = []
+                # ASR v2 path only when new flags are explicitly set;
+                # otherwise keep exact legacy behaviour (original run_asr, no new imports).
+                use_asr_v2 = (
+                    getattr(args, "asr_engine", "openai-whisper") != "openai-whisper"
+                    or bool(getattr(args, "asr_word_timestamps", False))
+                    or bool(getattr(args, "asr_vad", False))
+                )
 
-                if not pre_asr_segments and needs_asr:
-                    logger.info("  Запуск ASR (Whisper)...")
-                    pre_asr_segments, asr_elapsed = run_asr(video_path, whisper_model)
-                    logger.info(f"  ASR готов за {asr_elapsed:.1f}s, сегментов: {len(pre_asr_segments)}")
+                if needs_asr:
+                    if use_asr_v2:
+                        # ── New path: asr_v2 adapter ──────────────────────
+                        from asr_v2 import (
+                            AsrV2Config,
+                            AsrV2Error,
+                            asr_cache_sufficient,
+                            load_asr_from_cache,
+                            run_asr_v2,
+                            save_asr_artifacts,
+                        )
 
-                # ── Save shared asr_segments.json ─────────────────────────
-                _save_json(shared_dir / "asr_segments.json", pre_asr_segments)
+                        _asr_cfg = AsrV2Config(
+                            engine=getattr(args, "asr_engine", "openai-whisper"),
+                            whisper_model=whisper_model,
+                            word_timestamps=bool(getattr(args, "asr_word_timestamps", False)),
+                            vad=bool(getattr(args, "asr_vad", False)),
+                            compute_type=getattr(args, "asr_compute_type", "float16"),
+                            batch_size=int(getattr(args, "asr_batch_size", 8)),
+                            strict_real=bool(getattr(args, "strict_real", False)),
+                            audio_cache_dir=shared_dir,
+                        )
+
+                        if _resume and asr_cache_sufficient(shared_dir, _asr_cfg):
+                            try:
+                                _asr_v2_result = load_asr_from_cache(shared_dir)
+                                pre_asr_segments = _asr_v2_result.segments
+                                logger.info(
+                                    f"Resume: using cached shared ASR artifacts "
+                                    f"({len(pre_asr_segments)} segments, engine={_asr_cfg.engine})"
+                                )
+                            except Exception as _e:
+                                logger.warning(f"Resume ASR cache invalid ({_e}), recalculating")
+                                pre_asr_segments = []
+
+                        if not pre_asr_segments:
+                            logger.info(f"  Запуск ASR v2 ({_asr_cfg.engine})...")
+                            try:
+                                _asr_v2_result = run_asr_v2(video_path, _asr_cfg)
+                            except AsrV2Error as _asr_exc:
+                                logger.error(f"ASR failed: {_asr_exc}")
+                                if _asr_cfg.strict_real:
+                                    sys.exit(1)
+                                raise
+                            pre_asr_segments = _asr_v2_result.segments
+                            save_asr_artifacts(shared_dir, _asr_v2_result)
+                            logger.info(
+                                f"  ASR готов за {_asr_v2_result.elapsed_sec:.1f}s, "
+                                f"сегментов: {len(pre_asr_segments)}"
+                            )
+                    else:
+                        # ── Legacy path: openai-whisper, original behaviour ─
+                        _shared_asr = shared_dir / "asr_segments.json"
+                        if _resume and _shared_asr.exists():
+                            try:
+                                with open(_shared_asr, encoding="utf-8") as _f:
+                                    _loaded_asr = json.load(_f)
+                                if isinstance(_loaded_asr, list):
+                                    pre_asr_segments = _loaded_asr
+                                    logger.info(
+                                        f"Resume: using cached shared/asr_segments.json "
+                                        f"({len(pre_asr_segments)} segments)"
+                                    )
+                                else:
+                                    raise ValueError("not a list")
+                            except Exception as _e:
+                                logger.warning(
+                                    f"Resume asr_segments invalid ({_e}), recalculating"
+                                )
+                                pre_asr_segments = []
+
+                        if not pre_asr_segments:
+                            logger.info("  Запуск ASR (Whisper)...")
+                            pre_asr_segments, asr_elapsed = run_asr(video_path, whisper_model)
+                            logger.info(
+                                f"  ASR готов за {asr_elapsed:.1f}s, "
+                                f"сегментов: {len(pre_asr_segments)}"
+                            )
+
+                        _save_json(shared_dir / "asr_segments.json", pre_asr_segments)
+
+                if _asr_v2_result is not None and _asr_v2_result.quality:
+                    manifest["asr_quality"] = _asr_v2_result.quality
+                    _save_json(output_dir / "run_manifest.json", manifest)
 
                 # Кеш результатов режимов для этого видео (нужен trailer)
                 mode_results_cache: Dict = {}
