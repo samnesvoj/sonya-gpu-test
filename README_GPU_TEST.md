@@ -315,6 +315,47 @@ python benchmark_runner.py \
 
 ---
 
+## Promo avoidance generation v1
+
+Candidates are filtered before export selection to avoid promo / intro / sponsor / outro segments.
+Non-content zones are detected from structural weak signals and optional CLIP visual classification.
+Unsafe candidates are skipped before top-k export — not just flagged.
+
+```bash
+# Optional: install CLIP for visual classification
+pip install open_clip_torch
+
+python benchmark_runner.py \
+  --videos data/input \
+  --modes story viral trailer_preview \
+  --model yolov8n \
+  --whisper-model small \
+  --output outputs/promo_avoidance_check \
+  --strict-real \
+  --export-policy review-split \
+  --export-top-k 2 \
+  --non-content-detector auto
+```
+
+Without `open_clip_torch`, `--non-content-detector auto` falls back to structural weak signals only (no crash).
+
+**Artifacts per run:**
+- `candidate_safety_audit.json` — blocked/safe candidate breakdown
+- `shared/non_content_segments.json` — detected non-content zones
+- `shared/non_content_manifest.json` — detector summary
+- `export_decision.json → promo_safety` — counts used for export
+
+**Detector modes:**
+
+| `--non-content-detector` | Behaviour |
+|---|---|
+| `auto` (default) | CLIP if available + structural; fallback structural if no CLIP |
+| `structural` | Structural weak signals only (fast, no GPU) |
+| `clip` | CLIP required; fails with `--strict-real` if not installed |
+| `off` | No filtering, artifacts may be empty |
+
+---
+
 ## 12. Порядок режимов
 
 ```

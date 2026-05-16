@@ -1368,6 +1368,153 @@ _DIVERSITY_THRESHOLDS: Dict[str, Dict[str, float]] = {
 _DIVERSITY_DEFAULT: Dict[str, float] = {"max_overlap_ratio": 0.25, "min_gap_sec": 30.0}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Promo / non-content candidate safety filter
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Default block thresholds per label (overlap_ratio >= threshold → block)
+_PROMO_BLOCK_THRESHOLDS: Dict[str, float] = {
+    "intro_animation": 0.25,
+    "channel_promo":   0.20,
+    "sponsor_ad":      0.20,
+    "outro_endcard":   0.20,
+    "filler_or_music": 0.45,
+}
+
+# Mode-specific stricter overrides
+_PROMO_MODE_THRESHOLDS: Dict[str, Dict[str, float]] = {
+    "hook": {
+        "intro_animation": 0.10,
+        "channel_promo":   0.10,
+        "sponsor_ad":      0.15,
+        "outro_endcard":   0.10,
+    },
+    "viral": {
+        "channel_promo": 0.20,
+        "sponsor_ad":    0.20,
+    },
+    "educational": {
+        "sponsor_ad":    0.20,
+        "channel_promo": 0.25,
+    },
+    "story": {
+        "intro_animation": 0.20,
+        "outro_endcard":   0.20,
+    },
+}
+
+_NON_CONTENT_LABELS = {"intro_animation", "channel_promo", "sponsor_ad", "outro_endcard", "filler_or_music"}
+
+
+def _candidate_non_content_overlap(
+    candidate: Dict[str, Any],
+    non_content_segments: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Return per-label max overlap_ratio between candidate and non-content segments."""
+    bounds = _candidate_time_bounds(candidate)
+    if bounds is None or not non_content_segments:
+        return {}
+    cand_s, cand_e = bounds
+    cand_dur = cand_e - cand_s
+    if cand_dur <= 0:
+        return {}
+
+    label_overlap: Dict[str, float] = {}
+    for seg in non_content_segments:
+        label = seg.get("label", "unknown")
+        if label not in _NON_CONTENT_LABELS:
+            continue
+        try:
+            seg_s = float(seg["start_sec"])
+            seg_e = float(seg["end_sec"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        overlap = max(0.0, min(cand_e, seg_e) - max(cand_s, seg_s))
+        ratio = overlap / cand_dur
+        if ratio > label_overlap.get(label, 0.0):
+            label_overlap[label] = ratio
+    return label_overlap
+
+
+def _apply_promo_candidate_safety(
+    candidate: Dict[str, Any],
+    non_content_segments: List[Dict[str, Any]],
+    mode: str,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Return (is_safe, audit_dict). safe=True means candidate can be exported."""
+    overlap_by_label = _candidate_non_content_overlap(candidate, non_content_segments)
+    if not overlap_by_label:
+        return True, {"reason": "no_overlap", "overlap_by_label": {}}
+
+    mode_overrides = _PROMO_MODE_THRESHOLDS.get(mode, {})
+    max_label = max(overlap_by_label, key=overlap_by_label.get)
+    max_ratio = overlap_by_label[max_label]
+
+    for label, ratio in overlap_by_label.items():
+        threshold = mode_overrides.get(label, _PROMO_BLOCK_THRESHOLDS.get(label, 1.0))
+        if ratio >= threshold:
+            return False, {
+                "reason": "blocked_by_non_content_overlap",
+                "max_overlap_label": label,
+                "max_overlap_ratio": round(ratio, 4),
+                "threshold_used": threshold,
+                "overlap_by_label": {k: round(v, 4) for k, v in overlap_by_label.items()},
+            }
+
+    return True, {
+        "reason": "safe",
+        "max_overlap_label": max_label,
+        "max_overlap_ratio": round(max_ratio, 4),
+        "overlap_by_label": {k: round(v, 4) for k, v in overlap_by_label.items()},
+    }
+
+
+def _filter_promo_candidates(
+    candidates: List[Dict[str, Any]],
+    non_content_segments: List[Dict[str, Any]],
+    mode: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Filter candidates through promo safety. Returns (safe_candidates, audit)."""
+    if not non_content_segments:
+        return candidates, {
+            "policy": "promo_avoidance_generation_v1",
+            "mode": mode,
+            "original_candidates_count": len(candidates),
+            "safe_candidates_count": len(candidates),
+            "blocked_candidates_count": 0,
+            "blocked": [],
+            "non_content_segments_count": 0,
+        }
+
+    safe: List[Dict[str, Any]] = []
+    blocked_audit: List[Dict[str, Any]] = []
+
+    for orig_idx, cand in enumerate(candidates):
+        is_safe, overlap_audit = _apply_promo_candidate_safety(cand, non_content_segments, mode)
+        if is_safe:
+            safe.append(cand)
+        else:
+            bounds = _candidate_time_bounds(cand)
+            entry: Dict[str, Any] = {
+                "original_index": orig_idx,
+                "start_sec": round(bounds[0], 3) if bounds else None,
+                "end_sec": round(bounds[1], 3) if bounds else None,
+                **overlap_audit,
+            }
+            blocked_audit.append(entry)
+
+    audit: Dict[str, Any] = {
+        "policy": "promo_avoidance_generation_v1",
+        "mode": mode,
+        "original_candidates_count": len(candidates),
+        "safe_candidates_count": len(safe),
+        "blocked_candidates_count": len(blocked_audit),
+        "blocked": blocked_audit,
+        "non_content_segments_count": len(non_content_segments),
+    }
+    return safe, audit
+
+
 def _intervals_overlap_info(
     start_a: float, end_a: float,
     start_b: float, end_b: float,
@@ -2229,6 +2376,7 @@ def run_single(
     skip_export: bool = False,
     export_policy: str = "all",
     export_top_k: int = 1,
+    non_content_segments: Optional[List[Dict]] = None,
 ) -> Dict[str, Any]:
     """
     Прогоняет одно видео через один режим.
@@ -2410,7 +2558,30 @@ def run_single(
             _save_json(run_dir / "duration_trimmed.json", _raw_out["duration_trimmed"])
 
     # ── 4. Экспорт клипа ──────────────────────────────────────────────────────
-    top1_score = top1.get("score", None) if top1 else None
+    original_top1_score = top1.get("score", None) if top1 else None
+    top1_score = original_top1_score
+
+    # ── Promo / non-content candidate safety filter ───────────────────────────
+    _nc_segs: List[Dict] = non_content_segments or []
+    candidates_for_export, _promo_safety_audit = _filter_promo_candidates(
+        candidates, _nc_segs, mode
+    )
+    _save_json(run_dir / "candidate_safety_audit.json", _promo_safety_audit)
+
+    # Update top1_score to first safe candidate if filtering changed the pool
+    _safe_top1_score: Optional[float] = None
+    if candidates_for_export:
+        _safe_top1_score = candidates_for_export[0].get("score", None)
+        if _safe_top1_score is not None:
+            try:
+                _safe_top1_score = float(_safe_top1_score)
+            except (TypeError, ValueError):
+                _safe_top1_score = None
+    _promo_filter_changed_top1 = (_safe_top1_score != original_top1_score)
+    if candidates_for_export:
+        top1_score = _safe_top1_score
+
+    _promo_all_blocked = (len(candidates_for_export) == 0 and len(candidates) > 0)
 
     export_bucket = _resolve_export_bucket(export_decision, export_policy, skip_export)
     export_top_k_effective = max(1, int(export_top_k))
@@ -2428,9 +2599,16 @@ def run_single(
         "rejected": [],
     }
 
-    if export_bucket is not None and candidates:
+    if _promo_all_blocked:
+        export_error = "no_safe_candidates_after_promo_filter"
+        logger.warning(
+            "[promo_filter] All %d candidates blocked for %s/%s; skipping export",
+            len(candidates), video_path.name, mode,
+        )
+
+    if export_bucket is not None and candidates_for_export and not _promo_all_blocked:
         _diverse_selected, _export_selection_audit = _select_diverse_export_candidates(
-            candidates, export_top_k_effective, mode
+            candidates_for_export, export_top_k_effective, mode
         )
         _bucket_parent = output_dir / "exports" / export_bucket / mode
 
@@ -2540,6 +2718,17 @@ def run_single(
         "export_requested_top_k": export_top_k_effective,
         "export_selected_count": exported_clips_count,
         "export_selection_audit": _export_selection_audit,
+        "original_top1_score": original_top1_score,
+        "safe_top1_score": _safe_top1_score,
+        "promo_filter_changed_top1": _promo_filter_changed_top1,
+        "promo_safety": {
+            "policy": "promo_avoidance_generation_v1",
+            "original_candidates_count": _promo_safety_audit["original_candidates_count"],
+            "safe_candidates_count": _promo_safety_audit["safe_candidates_count"],
+            "blocked_candidates_count": _promo_safety_audit["blocked_candidates_count"],
+            "non_content_segments_count": _promo_safety_audit.get("non_content_segments_count", 0),
+            "used_for_export_selection": True,
+        },
     })
 
     vram_peak = max(_vram_used_mb(), vram_after_yolo) - vram_before
@@ -2589,6 +2778,9 @@ def run_single(
         "rejected_count": rejected_count,
         "main_reject_reason": main_reject_reason,
         "had_raw_signal": had_raw_signal,
+        # Promo safety counts (simple, kept out of large audit dicts)
+        "promo_blocked_candidates_count": _promo_safety_audit.get("blocked_candidates_count", 0),
+        "promo_safe_candidates_count": _promo_safety_audit.get("safe_candidates_count", len(candidates)),
         # Режим-специфичные метрики
         **mode_metrics,
         # Русские лейблы (для удобства чтения)
@@ -2918,6 +3110,18 @@ def main() -> None:
                         help="faster-whisper compute type")
     parser.add_argument("--asr-batch-size", type=int, default=8,
                         help="faster-whisper batch size")
+    parser.add_argument("--non-content-detector", default="auto",
+                        choices=["auto", "structural", "clip", "off"],
+                        help="Promo/non-content detector mode: auto (CLIP if available + structural), "
+                             "structural (weak signals only), clip (CLIP required), off (disabled)")
+    parser.add_argument("--non-content-window-sec", type=float, default=8.0,
+                        help="CLIP window size in seconds (default 8)")
+    parser.add_argument("--non-content-stride-sec", type=float, default=4.0,
+                        help="CLIP stride in seconds (default 4)")
+    parser.add_argument("--non-content-frames-per-window", type=int, default=3,
+                        help="Frames sampled per CLIP window (default 3)")
+    parser.add_argument("--non-content-confidence-threshold", type=float, default=0.30,
+                        help="CLIP confidence threshold for non-content classification (default 0.30)")
     parser.add_argument("--resume", action="store_true",
                         help="Resume: reuse cached shared/base_analysis.json and shared/asr_segments.json "
                              "from the same output dir (skip YOLO/ASR if cached)")
@@ -3149,6 +3353,46 @@ def main() -> None:
                     manifest["asr_quality"] = _asr_v2_result.quality
                     _save_json(output_dir / "run_manifest.json", manifest)
 
+                # ── Non-content detection (once per video) ────────────────────
+                _nc_detector_mode = getattr(args, "non_content_detector", "auto")
+                pre_non_content_segments: List[Dict] = []
+                if _nc_detector_mode != "off":
+                    try:
+                        from non_content_detector import (
+                            NonContentConfig as _NonContentConfig,
+                            build_non_content_segments as _build_nc,
+                            save_non_content_artifacts as _save_nc,
+                        )
+                        _nc_cfg = _NonContentConfig(
+                            detector=_nc_detector_mode,
+                            window_sec=float(getattr(args, "non_content_window_sec", 8.0)),
+                            stride_sec=float(getattr(args, "non_content_stride_sec", 4.0)),
+                            frames_per_window=int(getattr(args, "non_content_frames_per_window", 3)),
+                            confidence_threshold=float(getattr(
+                                args, "non_content_confidence_threshold", 0.30
+                            )),
+                            strict_real=bool(getattr(args, "strict_real", False)),
+                        )
+                        logger.info(
+                            f"  Non-content detector ({_nc_detector_mode})..."
+                        )
+                        pre_non_content_segments = _build_nc(
+                            video_path, pre_asr_segments, pre_duration, _nc_cfg
+                        )
+                        _save_nc(shared_dir, pre_non_content_segments, _nc_cfg,
+                                 used_for_filtering=True)
+                        logger.info(
+                            f"  Non-content segments: {len(pre_non_content_segments)}"
+                        )
+                    except ImportError:
+                        logger.warning("[non_content] non_content_detector.py not found, skipping")
+                    except Exception as _nc_exc:
+                        if getattr(args, "strict_real", False):
+                            raise
+                        logger.warning(
+                            f"[non_content] detection failed ({_nc_exc}), continuing without filter"
+                        )
+
                 # Кеш результатов режимов для этого видео (нужен trailer)
                 mode_results_cache: Dict = {}
 
@@ -3165,6 +3409,7 @@ def main() -> None:
                             skip_export=_effective_skip,
                             export_policy=_effective_export_policy,
                             export_top_k=int(getattr(args, "export_top_k", 1)),
+                            non_content_segments=pre_non_content_segments,
                         )
                         all_rows.append(row)
                     except Exception as e:
