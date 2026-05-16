@@ -1477,6 +1477,163 @@ def _select_diverse_export_candidates(
     return selected, audit
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ASR boundary refinement (export-layer only, v1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BOUNDARY_REFINER_CONFIG: Dict[str, Dict[str, float]] = {
+    "hook":            {"max_start_expand": 1.0, "max_end_expand": 1.0, "max_duration": 8.0},
+    "viral":           {"max_start_expand": 2.0, "max_end_expand": 3.0, "max_duration": 45.0},
+    "story":           {"max_start_expand": 3.0, "max_end_expand": 5.0, "max_duration": 90.0},
+    "educational":     {"max_start_expand": 4.0, "max_end_expand": 6.0, "max_duration": 60.0},
+    "trailer_preview": {"max_start_expand": 2.0, "max_end_expand": 4.0, "max_duration": 120.0},
+}
+_BOUNDARY_REFINER_DEFAULT: Dict[str, float] = {
+    "max_start_expand": 2.0,
+    "max_end_expand": 3.0,
+    "max_duration": 60.0,
+}
+# How close must the next segment start be to consider "clipping into new phrase"
+_BOUNDARY_NEXT_PHRASE_WINDOW_SEC: float = 0.8
+
+
+def _refine_export_candidate_boundaries(
+    candidate: Dict[str, Any],
+    asr_segments: List[Dict[str, Any]],
+    video_duration_sec: Optional[float],
+    mode: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Refine candidate start/end to align with ASR segment boundaries.
+
+    Rules (v1):
+    - start: if it falls inside an ASR segment, shift left to that segment's start
+              (up to max_start_expand).
+    - end: if it falls inside an ASR segment, shift right to that segment's end
+           (up to max_end_expand); never extend into the next unrelated phrase.
+    - duration is never reduced below original; capped by max_duration.
+    - Does NOT mutate candidate in-place; returns a copy.
+    - If no valid ASR or candidate bounds, returns candidate unchanged.
+    """
+    def _make_audit(
+        reason: str,
+        changed: bool,
+        orig_s: Optional[float] = None,
+        orig_e: Optional[float] = None,
+        ref_s: Optional[float] = None,
+        ref_e: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        entry: Dict[str, Any] = {
+            "policy": "asr_boundary_refiner_v1",
+            "changed": changed,
+            "reason": reason,
+            "mode": mode,
+        }
+        if orig_s is not None:
+            entry["original_start_sec"] = round(orig_s, 3)
+            entry["original_end_sec"] = round(orig_e, 3)  # type: ignore[arg-type]
+        if ref_s is not None:
+            entry["refined_start_sec"] = round(ref_s, 3)
+            entry["refined_end_sec"] = round(ref_e, 3)  # type: ignore[arg-type]
+            entry["start_delta_sec"] = round(ref_s - orig_s, 3)  # type: ignore[operator]
+            entry["end_delta_sec"] = round(ref_e - orig_e, 3)  # type: ignore[operator]
+        return entry
+
+    cfg = _BOUNDARY_REFINER_CONFIG.get(mode, _BOUNDARY_REFINER_DEFAULT)
+    max_start_expand: float = cfg["max_start_expand"]
+    max_end_expand: float = cfg["max_end_expand"]
+    max_duration: float = cfg["max_duration"]
+
+    # Validate inputs
+    if not asr_segments:
+        return candidate, _make_audit("no_asr_segments", False)
+
+    bounds = _candidate_time_bounds(candidate)
+    if bounds is None:
+        return candidate, _make_audit("invalid_candidate_bounds", False)
+
+    orig_start, orig_end = bounds
+    orig_dur = orig_end - orig_start
+
+    # Filter to segments that overlap or are adjacent to candidate window
+    look_window = max_end_expand + _BOUNDARY_NEXT_PHRASE_WINDOW_SEC
+    relevant = [
+        s for s in asr_segments
+        if isinstance(s, dict)
+        and s.get("end") is not None
+        and s.get("start") is not None
+        and float(s["end"]) > orig_start - max_start_expand
+        and float(s["start"]) < orig_end + look_window
+    ]
+    if not relevant:
+        return candidate, _make_audit("no_overlapping_asr_segments", False,
+                                      orig_start, orig_end)
+
+    # ── Refine start ──────────────────────────────────────────────────────────
+    new_start = orig_start
+    for seg in relevant:
+        seg_s = float(seg["start"])
+        seg_e = float(seg["end"])
+        # candidate start falls inside this segment → pull left to seg start
+        if seg_s < orig_start < seg_e:
+            candidate_left = max(orig_start - max_start_expand, 0.0)
+            if seg_s >= candidate_left:
+                new_start = min(new_start, seg_s)
+            break  # only consider the first overlapping segment for start
+
+    # ── Refine end ────────────────────────────────────────────────────────────
+    new_end = orig_end
+    for seg in sorted(relevant, key=lambda s: float(s["start"])):
+        seg_s = float(seg["start"])
+        seg_e = float(seg["end"])
+        # candidate end falls inside this segment → push right to seg end
+        if seg_s < orig_end < seg_e:
+            candidate_right = orig_end + max_end_expand
+            if seg_e <= candidate_right:
+                new_end = max(new_end, seg_e)
+            break
+        # Next phrase starts very soon after end — do NOT extend into it
+        if seg_s > orig_end and seg_s - orig_end < _BOUNDARY_NEXT_PHRASE_WINDOW_SEC:
+            # keep new_end as-is; don't pull in the next phrase
+            break
+
+    # ── Duration constraints ──────────────────────────────────────────────────
+    new_dur = new_end - new_start
+    if new_dur > max_duration:
+        # roll back end expansion first
+        new_end = new_start + max_duration
+        new_dur = max_duration
+    if new_dur < orig_dur:
+        # never shorten; restore original boundaries
+        return candidate, _make_audit("duration_constraint", False,
+                                      orig_start, orig_end)
+
+    # ── Clamp ─────────────────────────────────────────────────────────────────
+    new_start = max(0.0, new_start)
+    if video_duration_sec and video_duration_sec > 0:
+        new_end = min(new_end, video_duration_sec)
+    if new_end <= new_start:
+        return candidate, _make_audit("clamp_failed", False, orig_start, orig_end)
+
+    # ── No change? ───────────────────────────────────────────────────────────
+    if abs(new_start - orig_start) < 0.001 and abs(new_end - orig_end) < 0.001:
+        return candidate, _make_audit("no_change_needed", False, orig_start, orig_end)
+
+    # ── Build refined copy ────────────────────────────────────────────────────
+    refined = dict(candidate)
+    if "start_sec" in refined or "end_sec" in refined:
+        refined["start_sec"] = new_start
+        refined["end_sec"] = new_end
+    if "start" in refined or "end" in refined:
+        refined["start"] = new_start
+        refined["end"] = new_end
+    # Always set both so _candidate_time_bounds picks them up
+    refined["start_sec"] = new_start
+    refined["end_sec"] = new_end
+
+    audit = _make_audit("refined", True, orig_start, orig_end, new_start, new_end)
+    return refined, audit
+
+
 def export_clip(
     video_path: Path,
     start_sec: float,
@@ -2297,9 +2454,16 @@ def run_single(
                 exports_detail.append(row_base)
                 continue
 
-            start, end = bounds
+            # ── ASR boundary refinement ───────────────────────────────────────
+            _vid_dur = video_duration_sec if video_duration_sec and video_duration_sec > 0 else None
+            refined_cand, _boundary_audit = _refine_export_candidate_boundaries(
+                cand, asr_segments or [], _vid_dur, mode
+            )
+            refined_bounds = _candidate_time_bounds(refined_cand)
+            start, end = refined_bounds if refined_bounds is not None else bounds
             row_base["start_sec"] = round(start, 3)
             row_base["end_sec"] = round(end, 3)
+            row_base["boundary_refinement"] = _boundary_audit
 
             legacy_rank_path = run_dir / f"output_rank{rank_label}.mp4"
             ok_part, elapsed_part = export_clip(video_path, start, end, legacy_rank_path)
@@ -2310,7 +2474,7 @@ def run_single(
                 exports_detail.append(row_base)
                 continue
 
-            dur = _resolve_export_duration_sec(cand, legacy_rank_path)
+            dur = _resolve_export_duration_sec(refined_cand, legacy_rank_path)
             row_base["duration_sec"] = dur
 
             bucket_dest = _bucket_parent / f"rank{rank_label}_{run_id}.mp4"

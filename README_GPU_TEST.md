@@ -108,6 +108,8 @@ python benchmark_runner.py \
 
 ### Экспорт top-K кандидатов на режим (`--export-top-k`)
 
+> **ASR boundary refinement:** Export now applies ASR boundary refinement before writing clips. This may slightly expand clip start/end to avoid cutting speech mid-segment. Refinement details per rank are in `export_decision.json → exports[*].boundary_refinement`.
+
 > **Temporal diverse selection:** `--export-top-k` now uses temporal diversity.
 > rank02 is exported only if it differs sufficiently in time from rank01
 > (per-mode thresholds: gap ≥ 20–45 s, overlap ratio ≤ 0.20–0.30).
